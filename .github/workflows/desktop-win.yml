@@ -12,6 +12,9 @@ name: Build DSH Desktop (Windows, unsigned)
 # 触发：手动 / 每天定时检查上游新版本 / 本 workflow 变更时
 # 产物：GitHub Release（tag: desktop-v<版本>）+ Actions Artifacts
 #
+# 架构保证（64 位）：见 .github/scripts/verify-win-artifacts.mjs —— 主程序与随包分发的
+# node.exe 必须通过 PE 头 AMD64 校验；该脚本自身有 .test.mjs 回归测试，构建前先自测。
+#
 # 约定：所有 action 使用原生基于 Node 24 的大版本（已逐个核对 runs.using）：
 #   actions/checkout@v7  actions/setup-node@v7  actions/upload-artifact@v7
 #   pnpm/action-setup@v6
@@ -133,6 +136,11 @@ jobs:
           python --version || python3 --version
           echo "APP_ID=${APP_ID}"
 
+      # 自测架构校验器本身：8 个用例（含真实产物形态，以及主程序/node.exe 为 32 位或
+      # ARM64 的反例）。跑得很快，放在最前面，避免校验器自身出问题却只在收尾时才暴露。
+      - name: Self-test the artifact verifier
+        run: node .github/scripts/verify-win-artifacts.test.mjs
+
       - name: Clone upstream at the resolved commit
         shell: bash
         env:
@@ -186,20 +194,29 @@ jobs:
           DSH_DESKTOP_APP_ID: ${{ env.APP_ID }}
         run: pnpm run package:desktop:win:x64:unsigned
 
-      - name: List artifacts
+      # 架构闸门 + 产物清单。上游本来就没有 32 位通道（desktop-build-paths.mjs 的
+      # SUPPORTED_TARGETS 只有 mac-arm64 / mac-x64 / win-x64；package-target.ts 里 win-x64
+      # 硬编码 arch:'x64'），这里再补一层二进制级校验：主程序与随包分发的 node.exe 的
+      # PE Machine 必须是 AMD64(0x8664)。校验同时写出 artifacts.txt，供发布步骤只取顶层文件。
+      - name: Verify artifacts are Windows x64
         shell: bash
         run: |
           set -euo pipefail
-          DIR="upstream/apps/desktop/.desktop-build/targets/win-x64/unsigned-artifacts"
-          if [ ! -d "$DIR" ]; then echo "::error::未找到产物目录 $DIR"; exit 1; fi
-          echo "产物目录: $DIR"
-          find "$DIR" -type f -printf '%s\t%p\n' | sort -k2
+          node .github/scripts/verify-win-artifacts.mjs \
+            "upstream/apps/desktop/.desktop-build/targets/win-x64/unsigned-artifacts" \
+            artifacts.txt
 
+      # 只上传顶层文件：electron-builder 会在同一输出目录留下 win-unpacked/ 未打包目录
+      # （约 220 MB），既不该塞进 artifact，更不能交给 gh release upload —— 对目录
+      # 上传会失败（read .../win-unpacked: Incorrect function，并导致 gh 回滚整个 release）。
       - name: Upload artifacts
         uses: actions/upload-artifact@v7
         with:
           name: dsh-desktop-win-x64-unsigned-${{ needs.resolve.outputs.version }}
-          path: upstream/apps/desktop/.desktop-build/targets/win-x64/unsigned-artifacts/*
+          path: |
+            upstream/apps/desktop/.desktop-build/targets/win-x64/unsigned-artifacts/*.exe
+            upstream/apps/desktop/.desktop-build/targets/win-x64/unsigned-artifacts/*.blockmap
+            upstream/apps/desktop/.desktop-build/targets/win-x64/unsigned-artifacts/*.yml
           if-no-files-found: error
           retention-days: 30
 
@@ -213,9 +230,18 @@ jobs:
           APP_ID: ${{ env.APP_ID }}
         run: |
           set -euo pipefail
-          shopt -s nullglob
-          FILES=(upstream/apps/desktop/.desktop-build/targets/win-x64/unsigned-artifacts/*)
+          # artifacts.txt 由 verify 步骤写出，只含顶层可发布文件（已排除 win-unpacked/ 与
+          # builder-debug.yml）。绝不能再对目录做 glob —— 那正是上一次失败的根因。
+          FILES=()
+          while IFS= read -r line; do
+            if [ -n "$line" ]; then FILES+=("$line"); fi
+          done < artifacts.txt
           if [ ${#FILES[@]} -eq 0 ]; then echo "::error::没有可发布的产物"; exit 1; fi
+          echo "将发布 ${#FILES[@]} 个文件："
+          printf '  %s\n' "${FILES[@]}"
+          for f in "${FILES[@]}"; do
+            if [ ! -f "$f" ]; then echo "::error::清单中的路径不是文件：$f"; exit 1; fi
+          done
 
           PRERELEASE=""
           case "${VERSION}" in *-*) PRERELEASE="--prerelease" ;; esac
@@ -224,6 +250,8 @@ jobs:
           NOTES="${NOTES}"$'\n\n'"- 上游版本: \`${VERSION}\`"
           NOTES="${NOTES}"$'\n'"- 上游提交: \`${SHA}\`"
           NOTES="${NOTES}"$'\n'"- 应用 ID: \`${APP_ID}\`"
+          NOTES="${NOTES}"$'\n'"- **64 位（x64）**：主程序与随包分发的 node.exe 均经 PE 头校验为 AMD64；不含 32 位应用"
+          NOTES="${NOTES}"$'\n'"  （安装包外壳是 NSIS 的 32 位引导程序，属 NSIS 自身限制，与安装后的应用位数无关）"
           NOTES="${NOTES}"$'\n'"- **未签名**：Windows SmartScreen 会提示未知发布者，安装时选「更多信息 → 仍要运行」"
           NOTES="${NOTES}"$'\n'"- 未签名包不含自动更新配置，属本地安装测试用途"
           NOTES="${NOTES}"$'\n\n'"由 DshDocker 的 desktop-win workflow 自动构建。"
