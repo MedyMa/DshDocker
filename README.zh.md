@@ -295,6 +295,118 @@ docker buildx build --platform linux/arm64 -t dshdocker .
 
 ---
 
+## 上游发新版后如何重建镜像
+
+### 一、常规情况：什么都不用做（全自动）
+
+CI 里有每天定时任务（`cron: "0 2 * * *"`，UTC = **北京时间 10:00**），每天会：
+
+1. 浅克隆上游 `master`
+2. 读它的 commit SHA 与 `package.json` 版本号
+3. **该 SHA 的镜像已存在就跳过**（不空跑）
+4. 有新提交 → 构建 amd64 + arm64 → 推送
+
+**所以上游发版后，最迟次日早上 10 点就有新镜像。** 你只需要：
+
+```bash
+docker pull ghcr.io/medyma/dshdocker:latest
+
+docker rm -f dsh && docker run -d --name dsh --restart unless-stopped \
+  --network host \
+  -v dsh-home:/home/node/.dsh \
+  -v "$PWD/workspace:/workspace" \
+  -e DSH_TRUSTED_HOSTS="192.168.2.1,dsh.example.com" \
+  -e DSH_ALLOW_REMOTE_SETTINGS=1 \
+  -e DEEPSEEK_API_KEY=sk-xxxxxxxx \
+  ghcr.io/medyma/dshdocker:latest
+```
+
+> 数据卷 `dsh-home` 会保留 —— **模型配置、会话、凭证都不丢**。
+
+### 二、不想等定时：手动立刻构建
+
+**GitHub → Actions → Build & Push DSH Image (from source) → Run workflow**
+
+| 输入 | 说明 |
+|---|---|
+| `ref` | 上游 ref。**留空 = master 最新**；也可填 `v0.1.5-rc.3` 这类标签或具体 commit |
+| `force` | 勾上忽略「镜像已存在」检查（手动触发本来就会构建，一般不用勾）|
+
+> 手动触发（`workflow_dispatch`）不受跳过逻辑影响，**一定会构建**。
+
+### 三、锁定某个版本
+
+`ref` 填上游标签后，会产出这些 tag：
+
+| Tag | 用途 |
+|---|---|
+| `0.1.5-rc.3` | 上游版本号 |
+| `sha-<上游commit>` | **最精确，生产建议用这个** |
+| `latest` | 也会同步更新 |
+
+```bash
+# 生产环境建议锁精确 tag，避免 latest 漂移
+ghcr.io/medyma/dshdocker:sha-<上游commit>
+```
+
+查看已有 tag：GitHub → Packages → `dshdocker`。
+
+### 四、完全不用 GitHub：本地构建
+
+```bash
+git clone https://github.com/MedyMa/DshDocker.git && cd DshDocker
+
+docker build -t dshdocker .                                    # 最新 master
+docker build --build-arg DSH_REF=v0.1.5-rc.3 -t dshdocker .    # 指定版本
+docker buildx build --platform linux/arm64 -t dshdocker .      # 交叉构建 arm64
+```
+
+拷到路由器：
+
+```bash
+docker save dshdocker | gzip > dsh.tgz
+scp dsh.tgz root@192.168.2.1:/tmp/
+# 路由器上
+gunzip -c /tmp/dsh.tgz | docker load
+```
+
+> ⚠️ 上游构建很重（tsc 4GB 堆 + 前端 + 原生插件），x86 上约 5–10 分钟，**别在路由器上构建**。
+
+### 五、怎么知道有没有新版
+
+```bash
+# 上游 npm 上的最新版本号
+curl -s https://registry.npmjs.org/@deepseek-ai/dsh/latest | head -c 200
+
+# 你容器里跑的版本
+docker exec dsh node -e "console.log(require('/src/package.json').version)"
+```
+
+再看 GitHub → Actions，有没有新的自动构建记录。
+
+### 六、自动构建失败怎么办
+
+Actions → 点开那条失败的 run → 看红叉 job 的日志。常见三类：
+
+| 现象 | 原因 | 处理 |
+|---|---|---|
+| `pnpm install` 失败 | 上游改了 lockfile / 依赖 | 多为上游临时问题，稍后 **Re-run jobs** |
+| `pnpm run build` 失败 | 上游改了构建脚本 | 把报错发到仓库 Issue，需更新 Dockerfile |
+| 找不到 ref | 上游改了分支名 | 用 `ref` 指定正确分支 |
+
+重跑：Actions → 那条 run → 右上角 **Re-run jobs**。
+
+### 七、一句话总结
+
+| 场景 | 你要做什么 |
+|---|---|
+| **上游发新版（常规）** | **什么都不用做** —— 次日自动构建，你只管 `docker pull` + 重启容器 |
+| 想立刻要 | Actions 手动 Run workflow（`ref` 留空）|
+| 要固定版本 | `ref` 填标签，容器里用 `sha-xxx` tag |
+| 不用 GitHub | 本地 `docker build` + `docker save/load` |
+
+---
+
 ## 许可
 
 [MIT](LICENSE)。DeepSeek Harness 本身遵循其作者自己的许可。

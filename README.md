@@ -309,6 +309,119 @@ Node 20 deprecation warnings.
 
 ---
 
+## Rebuilding after upstream releases a new version
+
+### 1. Normal case: nothing to do (fully automatic)
+
+A daily schedule (`cron: "0 2 * * *"`, UTC = **10:00 Beijing**) does:
+
+1. shallow-clone upstream `master`
+2. read its commit SHA and `package.json` version
+3. **skip if the image for that SHA already exists** (no wasted builds)
+4. otherwise build amd64 + arm64 and push
+
+So a new upstream release lands in your registry by ~10:00 the next day. All you run:
+
+```bash
+docker pull ghcr.io/medyma/dshdocker:latest
+
+docker rm -f dsh && docker run -d --name dsh --restart unless-stopped \
+  --network host \
+  -v dsh-home:/home/node/.dsh \
+  -v "$PWD/workspace:/workspace" \
+  -e DSH_TRUSTED_HOSTS="192.168.2.1,dsh.example.com" \
+  -e DSH_ALLOW_REMOTE_SETTINGS=1 \
+  -e DEEPSEEK_API_KEY=sk-xxxxxxxx \
+  ghcr.io/medyma/dshdocker:latest
+```
+
+> The `dsh-home` volume persists, so **model config, sessions and credentials survive**.
+
+### 2. Don't want to wait: trigger it manually
+
+**GitHub → Actions → Build & Push DSH Image (from source) → Run workflow**
+
+| Input | Meaning |
+|---|---|
+| `ref` | Upstream ref. **Empty = latest `master`**; or `v0.1.5-rc.3`, or a commit SHA |
+| `force` | Ignore the "image already exists" check (manual runs always build anyway) |
+
+> `workflow_dispatch` is never subject to the skip logic — it always builds.
+
+### 3. Pin a specific version
+
+Set `ref` to an upstream tag; the build produces:
+
+| Tag | Use |
+|---|---|
+| `0.1.5-rc.3` | upstream version |
+| `sha-<upstream-commit>` | **most precise — preferred for production** |
+| `latest` | also updated |
+
+```bash
+# production: pin the exact tag so `latest` can't drift under you
+ghcr.io/medyma/dshdocker:sha-<upstream-commit>
+```
+
+List existing tags: GitHub → Packages → `dshdocker`.
+
+### 4. Without GitHub at all: build locally
+
+```bash
+git clone https://github.com/MedyMa/DshDocker.git && cd DshDocker
+
+docker build -t dshdocker .                                    # latest master
+docker build --build-arg DSH_REF=v0.1.5-rc.3 -t dshdocker .    # specific version
+docker buildx build --platform linux/arm64 -t dshdocker .      # cross-build arm64
+```
+
+Ship it to the router:
+
+```bash
+docker save dshdocker | gzip > dsh.tgz
+scp dsh.tgz root@192.168.2.1:/tmp/
+# on the router
+gunzip -c /tmp/dsh.tgz | docker load
+```
+
+> ⚠️ The upstream build is heavy (tsc with a 4 GB heap + frontend + native addons),
+> roughly 5–10 minutes on x86. **Never build on the router.**
+
+### 5. Checking for new versions
+
+```bash
+# latest version published on npm
+curl -s https://registry.npmjs.org/@deepseek-ai/dsh/latest | head -c 200
+
+# the version your container runs
+docker exec dsh node -e "console.log(require('/src/package.json').version)"
+```
+
+Then look at GitHub → Actions for a recent automated build.
+
+### 6. If an automated build fails
+
+Actions → open the failed run → check the red job's log. Three usual causes:
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `pnpm install` fails | upstream changed the lockfile/deps | usually transient upstream — **Re-run jobs** later |
+| `pnpm run build` fails | upstream changed the build script | open an issue with the error; the Dockerfile needs updating |
+| ref not found | upstream renamed a branch | pass the right branch via `ref` |
+
+Re-run: Actions → that run → **Re-run jobs** (top right).
+
+### 7. TL;DR
+
+| Situation | What you do |
+|---|---|
+| **Upstream releases (normal)** | **nothing** — next-day auto build, then `docker pull` + recreate the container |
+| Want it now | Actions → Run workflow (`ref` empty) |
+| Need a fixed version | set `ref`, use the `sha-xxx` tag in your container |
+| Avoid GitHub | local `docker build` + `docker save/load` |
+
+---
+
 ## License
 
 [MIT](LICENSE). DeepSeek Harness itself is licensed by its own authors.
