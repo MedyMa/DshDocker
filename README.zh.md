@@ -22,7 +22,7 @@ ghcr.io/medyma/dshdocker:latest
 docker run -d --name dsh \
   --restart unless-stopped \
   -p 3080:3080 \
-  -v dsh-home:/home/dsh/.dsh \
+  -v dsh-home:/home/node/.dsh \
   -v "$PWD/workspace:/workspace" \
   -e DSH_TRUSTED_HOSTS="192.168.1.10:3080" \
   ghcr.io/medyma/dshdocker:latest
@@ -96,17 +96,18 @@ docker buildx build --platform linux/arm64 -t dshdocker .
 | `DSH_HOST` | `0.0.0.0` | Web UI 监听地址 |
 | `DSH_PORT` | `3080` | 监听端口 |
 | `DSH_TRUSTED_HOSTS` | 空 | 逗号分隔的额外可信 authority，供 `/api` 的浏览器信任围栏校验。**只要不是用 localhost 访问就必须填**，例如 `192.168.1.10:3080,dsh.local:3080` |
-| `DSH_HOME` | `/home/dsh/.dsh` | DSH 数据根目录（凭证 / 设置 / 会话 / profile）|
+| `DSH_HOME` | `/home/node/.dsh` | DSH 数据根目录（凭证 / 设置 / 会话 / profile）|
 | `DSH_TELEMETRY_DISABLED` | `1` | 关闭遥测 |
 
 ### 数据卷
 
 | 路径 | 用途 |
 |---|---|
-| `/home/dsh/.dsh` | **必须持久化。** 凭证、设置、会话、profile、storages |
+| `/home/node/.dsh` | **必须持久化。** 凭证、设置、会话、profile、storages |
 | `/workspace` | DSH 读写文件、执行命令的工作目录 |
 
-> 容器以 **UID 1000** 运行。bind mount 时要 `sudo chown -R 1000:1000 ./data ./workspace`
+> 容器以基础镜像自带的 **`node` 用户（UID/GID 1000）** 运行，不是 root。
+> bind mount 时要 `sudo chown -R 1000:1000 ./data ./workspace`
 
 ### 跑 web 之外的模式
 
@@ -114,7 +115,7 @@ docker buildx build --platform linux/arm64 -t dshdocker .
 
 ```bash
 # headless：跑一个任务，打印结果后退出
-docker run --rm -v dsh-home:/home/dsh/.dsh \
+docker run --rm -v dsh-home:/home/node/.dsh \
   ghcr.io/medyma/dshdocker:latest --profile headless "总结 /workspace/notes.txt"
 
 # 进容器

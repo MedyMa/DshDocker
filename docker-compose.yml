@@ -19,6 +19,6 @@ services:
       TZ: "Asia/Shanghai"
     volumes:
       # DSH_HOME：凭证 / 设置 / 会话 / profile（务必持久化）
-      - ./data/dsh:/home/dsh/.dsh
+      - ./data/dsh:/home/node/.dsh
       # 工作区：dsh 的文件读写与命令执行根目录
       - ./workspace:/workspace

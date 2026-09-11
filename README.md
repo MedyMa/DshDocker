@@ -22,7 +22,7 @@ ghcr.io/medyma/dshdocker:latest
 docker run -d --name dsh \
   --restart unless-stopped \
   -p 3080:3080 \
-  -v dsh-home:/home/dsh/.dsh \
+  -v dsh-home:/home/node/.dsh \
   -v "$PWD/workspace:/workspace" \
   -e DSH_TRUSTED_HOSTS="192.168.1.10:3080" \
   ghcr.io/medyma/dshdocker:latest
@@ -98,18 +98,18 @@ docker buildx build --platform linux/arm64 -t dshdocker .
 | `DSH_HOST` | `0.0.0.0` | Bind host for the web UI |
 | `DSH_PORT` | `3080` | Listen port |
 | `DSH_TRUSTED_HOSTS` | *(empty)* | Comma-separated extra authorities accepted by the `/api` browser-trust fence. **Required when you access the UI from anything other than localhost.** e.g. `192.168.1.10:3080,dsh.local:3080` |
-| `DSH_HOME` | `/home/dsh/.dsh` | DSH data root (credentials, settings, sessions, profiles) |
+| `DSH_HOME` | `/home/node/.dsh` | DSH data root (credentials, settings, sessions, profiles) |
 | `DSH_TELEMETRY_DISABLED` | `1` | Disable telemetry |
 
 ### Volumes
 
 | Path | Purpose |
 |---|---|
-| `/home/dsh/.dsh` | **Persist this.** Credentials, settings, sessions, profiles, storages. |
+| `/home/node/.dsh` | **Persist this.** Credentials, settings, sessions, profiles, storages. |
 | `/workspace` | Working directory DSH reads/writes and runs commands in |
 
-> The container runs as **UID 1000**. For bind mounts:
-> `sudo chown -R 1000:1000 ./data ./workspace`
+> The container runs as the base image's **`node` user (UID/GID 1000)** — not root.
+> For bind mounts: `sudo chown -R 1000:1000 ./data ./workspace`
 
 ### Running other modes
 
@@ -117,7 +117,7 @@ The entrypoint runs `dsh web` by default; **any arguments are forwarded to the C
 
 ```bash
 # headless: run one task, print the answer, exit
-docker run --rm -v dsh-home:/home/dsh/.dsh \
+docker run --rm -v dsh-home:/home/node/.dsh \
   ghcr.io/medyma/dshdocker:latest --profile headless "summarize /workspace/notes.txt"
 
 # shell inside the container

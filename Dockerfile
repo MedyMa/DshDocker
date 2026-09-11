@@ -92,23 +92,24 @@ RUN apt-get update \
 # 构建产物整棵树（含 workspace 软链与原生模块）
 COPY --from=builder /src /src
 
-RUN useradd -m -u 1000 -s /bin/bash dsh
-
-ENV DSH_HOME=/home/dsh/.dsh \
+# 非 root 运行：直接用基础镜像自带的 node 用户（UID/GID 1000）。
+# 注意：不要 useradd -u 1000 自建用户 —— node 镜像里 UID 1000 已被 node 占用，
+# 会以 "UID 1000 is not unique" 失败（exit code 4）。
+ENV DSH_HOME=/home/node/.dsh \
     DSH_HOST=0.0.0.0 \
     DSH_PORT=3080 \
     DSH_TELEMETRY_DISABLED=1 \
     DSH_BIN=/src/apps/cli/lib/bin.js
 
 RUN mkdir -p /workspace "${DSH_HOME}" \
- && chown -R dsh:dsh /workspace "${DSH_HOME}"
+ && chown -R node:node /workspace "${DSH_HOME}"
 
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
-VOLUME ["/home/dsh/.dsh", "/workspace"]
+VOLUME ["/home/node/.dsh", "/workspace"]
 WORKDIR /workspace
-USER dsh
+USER node
 EXPOSE 3080
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/docker-entrypoint.sh"]
