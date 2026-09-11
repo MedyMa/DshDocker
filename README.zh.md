@@ -119,6 +119,81 @@ docker logs dsh 2>&1 | grep 'dsh web:'
 > 如果代理把 `Host` 改写成了 `127.0.0.1:30801`，围栏会当作 loopback 放行，但浏览器发出的
 > `Origin` 就对不上了 —— 正确做法是声明真实 authority。
 
+### ⚠️ 设置页只在 loopback 可用 —— 模型配置请走下面两条路
+
+DSH 对「设置文档」有 loopback 限制（`dsh-client-ui-settings/lib/client.js:1345`）：
+
+```js
+const persistence = ctx.remote.$host.isLoopback ? "host" : "memory";
+```
+
+`isLoopback` 判断的是**浏览器地址栏里的主机名**，只认 `localhost` / `127.x.x.x` / `[::1]`
+（`dsh-client-connection/lib/client.js:6344`）。所以在 `memory` 模式下设置文档不会加载，
+「模型」页会报 `加载提供方目录失败: settings are unavailable in this browser`。
+
+| 访问地址 | 聊天 | 设置页（模型） |
+|---|---|---|
+| `http://127.0.0.1:3080` | ✅ | ✅ |
+| `http://192.168.x.x:3080` | ✅ | ❌ |
+| `https://<穿透域名>` | ✅ | ❌ |
+
+这是上游**有意的安全设计**（设置里含 API Key）。配置模型有两条路：
+
+**A. SSH 本地转发，让浏览器变成 loopback（推荐）**
+
+```bash
+# 在你自己的电脑上执行，窗口保持打开
+ssh -N -L 3080:127.0.0.1:3080 root@<路由器IP>
+
+# 取 token
+docker logs dsh 2>&1 | sed -n 's/.*[?&]token=\([A-Za-z0-9_-]*\).*/\1/p' | tail -n1
+
+# 浏览器打开（必须是 127.0.0.1）
+#   http://127.0.0.1:3080/?token=<TOKEN>
+```
+
+配置写进容器 `DSH_HOME`（服务端持久化），之后日常继续用穿透域名即可。
+
+**B. 直接写 `settings.yaml`（不用浏览器）**
+
+模板见 [`examples/settings.deepseek.yaml`](examples/settings.deepseek.yaml)（DeepSeek 官方公网 API）。
+
+如果要接自己的 OpenAI / Anthropic 兼容服务，按 `llm-pi-ai` 加一段即可：
+
+```yaml
+llm-pi-ai:
+  providers:
+    myprovider:
+      displayName: My Provider
+      apiKeyEnv: MY_PROVIDER_API_KEY     # Key 用这个环境变量名传入
+      api: anthropic-messages            # 或 openai-chat-completions
+      baseURL: https://api.example.com/v1
+      models:
+        - id: my-model
+          name: my-model
+          contextWindow: 128000
+          maxTokens: 8192
+agent-default-model:
+  provider: myprovider
+  model: my-model
+```
+
+写进数据卷并重启：
+
+```bash
+MP=$(docker volume inspect dsh-home --format '{{.Mountpoint}}')
+cp examples/settings.deepseek.yaml "$MP/settings.yaml"     # 或写你自己的那份
+chown 1000:1000 "$MP/settings.yaml"
+docker restart dsh
+```
+
+API Key 用环境变量传入（名字取自 provider 的 `apiKeyEnv`）：
+
+```bash
+-e DEEPSEEK_API_KEY=sk-xxxxxxxx
+-e MY_PROVIDER_API_KEY=xxxxxxxx
+```
+
 ---
 
 ## 配置

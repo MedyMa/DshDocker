@@ -1,0 +1,24 @@
+# DshDocker 示例配置：使用 DeepSeek 官方公网 API（内置 llm-deepseek）
+#
+# 适合家用路由器 / 无公司内网的环境。
+#
+# 放到容器的 DSH_HOME 里：<dsh-home 卷的 Mountpoint>/settings.yaml
+#   docker volume inspect dsh-home --format '{{.Mountpoint}}'
+#   chown 1000:1000 <mountpoint>/settings.yaml
+#   docker restart dsh
+#
+# API Key 通过环境变量传入（默认名就是 DEEPSEEK_API_KEY）：
+#   docker run ... -e DEEPSEEK_API_KEY=sk-xxxxxxxx ...
+#
+# 内置 provider id 是 "deepseek-official"（插件名/配置节是 llm-deepseek）。
+# 可用模型 id：deepseek-flash / deepseek-v4-flash / deepseek-v4-flash-vision-exp / deepseek-v4-pro
+
+llm-deepseek:
+  apiKeyEnv: DEEPSEEK_API_KEY
+
+agent-default-model:
+  provider: deepseek-official
+  model: deepseek-v4-flash
+
+permission:
+  defaultPreset: danger-full-access

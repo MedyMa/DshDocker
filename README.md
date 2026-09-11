@@ -126,6 +126,83 @@ Add the IP/host you browse with:
 > If your proxy rewrites `Host` to `127.0.0.1:30801`, the fence passes as loopback, but the
 > browser's `Origin` will no longer match — declare the real authority instead.
 
+### ⚠️ Settings only work on a loopback page — configure the model like this
+
+DSH gates the settings document on loopback (`dsh-client-ui-settings/lib/client.js:1345`):
+
+```js
+const persistence = ctx.remote.$host.isLoopback ? "host" : "memory";
+```
+
+`isLoopback` is computed from **the browser's address-bar hostname** and only accepts
+`localhost` / `127.x.x.x` / `[::1]` (`dsh-client-connection/lib/client.js:6344`). On a
+`memory` page the document never loads, so the Models tab reports
+`settings are unavailable in this browser`.
+
+| Address | Chat | Settings (Models) |
+|---|---|---|
+| `http://127.0.0.1:3080` | ✅ | ✅ |
+| `http://192.168.x.x:3080` | ✅ | ❌ |
+| `https://<tunnel domain>` | ✅ | ❌ |
+
+This is a deliberate upstream safeguard (settings hold API keys). Two ways to configure:
+
+**A. SSH local forward so the browser is loopback (recommended)**
+
+```bash
+# on your own machine, keep this window open
+ssh -N -L 3080:127.0.0.1:3080 root@<router-ip>
+
+# read the token
+docker logs dsh 2>&1 | sed -n 's/.*[?&]token=\([A-Za-z0-9_-]*\).*/\1/p' | tail -n1
+
+# open in the browser (127.0.0.1 is required)
+#   http://127.0.0.1:3080/?token=<TOKEN>
+```
+
+The config lands in the container's `DSH_HOME`, so afterwards you can go back to the
+tunnel domain for normal use.
+
+**B. Write `settings.yaml` directly (no browser)**
+
+Template: [`examples/settings.deepseek.yaml`](examples/settings.deepseek.yaml) (public DeepSeek API).
+
+To point at your own OpenAI / Anthropic-compatible service, add an `llm-pi-ai` provider:
+
+```yaml
+llm-pi-ai:
+  providers:
+    myprovider:
+      displayName: My Provider
+      apiKeyEnv: MY_PROVIDER_API_KEY     # the env var that carries the key
+      api: anthropic-messages            # or openai-chat-completions
+      baseURL: https://api.example.com/v1
+      models:
+        - id: my-model
+          name: my-model
+          contextWindow: 128000
+          maxTokens: 8192
+agent-default-model:
+  provider: myprovider
+  model: my-model
+```
+
+Install it into the volume and restart:
+
+```bash
+MP=$(docker volume inspect dsh-home --format '{{.Mountpoint}}')
+cp examples/settings.deepseek.yaml "$MP/settings.yaml"     # or your own file
+chown 1000:1000 "$MP/settings.yaml"
+docker restart dsh
+```
+
+Pass the key as an environment variable (named by the provider's `apiKeyEnv`):
+
+```bash
+-e DEEPSEEK_API_KEY=sk-xxxxxxxx
+-e MY_PROVIDER_API_KEY=xxxxxxxx
+```
+
 ---
 
 ## Configuration
