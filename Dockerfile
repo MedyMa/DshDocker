@@ -92,6 +92,14 @@ RUN apt-get update \
 # 构建产物整棵树（含 workspace 软链与原生模块）
 COPY --from=builder /src /src
 
+# 让 node 用户能在运行时改写这两个客户端插件文件。
+# 用途：DSH_ALLOW_REMOTE_SETTINGS=1 时，入口脚本解除设置页的 loopback 门控，
+# 使局域网 IP / 穿透域名也能读写设置（含 API Key）—— 默认关闭。
+RUN for d in /src/packages/client/ui-settings/lib /src/packages/client/ui-settings-general/lib; do \
+      if [ -d "$d" ]; then chown -R node:node "$d"; echo "writable: $d"; \
+      else echo "warn: missing $d"; fi; \
+    done
+
 # 非 root 运行：直接用基础镜像自带的 node 用户（UID/GID 1000）。
 # 注意：不要 useradd -u 1000 自建用户 —— node 镜像里 UID 1000 已被 node 占用，
 # 会以 "UID 1000 is not unique" 失败（exit code 4）。
@@ -103,6 +111,7 @@ COPY --from=builder /src /src
 ENV DSH_HOME=/home/node/.dsh \
     DSH_PORT=3080 \
     DSH_WEB_INTERNAL_PORT=30801 \
+    DSH_ALLOW_REMOTE_SETTINGS=0 \
     DSH_TELEMETRY_DISABLED=1 \
     DSH_BIN=/src/apps/cli/lib/bin.js
 

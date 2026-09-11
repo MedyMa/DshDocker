@@ -145,7 +145,7 @@ const persistence = ctx.remote.$host.isLoopback ? "host" : "memory";
 | `http://192.168.x.x:3080` | ✅ | ❌ |
 | `https://<tunnel domain>` | ✅ | ❌ |
 
-This is a deliberate upstream safeguard (settings hold API keys). Two ways to configure:
+This is a deliberate upstream safeguard (settings hold API keys). Three ways:
 
 **A. SSH local forward so the browser is loopback (recommended)**
 
@@ -203,6 +203,31 @@ Pass the key as an environment variable (named by the provider's `apiKeyEnv`):
 -e MY_PROVIDER_API_KEY=xxxxxxxx
 ```
 
+**C. Lift the restriction: `DSH_ALLOW_REMOTE_SETTINGS=1`**
+
+This image ships a switch that, at container start, rewrites the two client-side
+loopback checks to be unconditionally true — so the Models and Plugins settings pages
+work from a LAN IP or a tunnel domain too.
+
+```bash
+docker rm -f dsh
+docker run -d --name dsh --restart unless-stopped --network host \
+  -v dsh-home:/home/node/.dsh -v "$PWD/workspace:/workspace" \
+  -e DSH_TRUSTED_HOSTS="192.168.2.1,dsh.example.com" \
+  -e DSH_ALLOW_REMOTE_SETTINGS=1 \
+  -e DEEPSEEK_API_KEY=sk-xxxxxxxx \
+  ghcr.io/medyma/dshdocker:latest
+```
+
+> ⚠️ **Security trade-off**: this removes an upstream protection. The settings page holds
+> your API keys, so once enabled **anyone who can reach that address can read and change
+> them**. Real risk on a public tunnel domain — judge for yourself.
+>
+> The patch is applied at **runtime** to the client plugin files
+> (`ui-settings` / `ui-settings-general` `lib/client.js`); the image itself is unchanged,
+> and turning the switch off restores upstream behaviour. Hard-refresh the browser
+> (Ctrl+Shift+R) afterwards to drop the cached plugin bundle.
+
 ---
 
 ## Configuration
@@ -214,6 +239,7 @@ Pass the key as an environment variable (named by the provider's `apiKeyEnv`):
 | `DSH_PORT` | `3080` | Exposed / forwarder listen port inside the container |
 | `DSH_WEB_INTERNAL_PORT` | `30801` | Internal loopback port the `dsh web` server binds |
 | `DSH_TRUSTED_HOSTS` | *(empty)* | Comma-separated authorities accepted by the `/api` fence. **Required for any non-localhost access.** Port-less entries match any port. |
+| `DSH_ALLOW_REMOTE_SETTINGS` | `0` | `=1` lifts the loopback-only settings gate (see C above). ⚠️ exposes API-key read/write to anyone who can reach the address |
 | `DSH_BIN` | `/src/apps/cli/lib/bin.js` | CLI entry produced by the source build |
 | `DSH_HOME` | `/home/node/.dsh` | DSH data root (credentials, settings, sessions, profiles) |
 | `DSH_TELEMETRY_DISABLED` | `1` | Disable telemetry |

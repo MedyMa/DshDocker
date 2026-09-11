@@ -13,9 +13,51 @@
 #   DSH_WEB_INTERNAL_PORT      dsh 内部 loopback 端口（默认 30801）
 #   DSH_TRUSTED_HOSTS          逗号分隔的可信 authority（**非 localhost 访问必填**）
 #                              例：192.168.2.1,dsh.example.com
+#   DSH_ALLOW_REMOTE_SETTINGS  =1 时解除「设置页仅 loopback 可用」的限制（默认 0）
+#                              ⚠️ 会让任意能访问该地址的人读写设置（含 API Key）
 set -euo pipefail
 
 DSH_BIN="${DSH_BIN:-/src/apps/cli/lib/bin.js}"
+
+# ---------------------------------------------------------------------------
+# 可选：解除「设置页仅 loopback 可用」的限制（DSH_ALLOW_REMOTE_SETTINGS=1）
+#
+# 上游在客户端硬编码了持久化模式（源码 packages/client/ui-settings/src/client/index.ts:58）：
+#   const persistence = ctx.remote.$host.isLoopback ? 'host' : 'memory'
+# 非 loopback 页面落到 memory 模式 → 设置文档不加载 →
+#   模型页报 "settings are unavailable in this browser"、插件配置空白。
+#
+# 该判断只在浏览器端，且这两个客户端插件是运行时单独加载的 lib/client.js，
+# 所以启动前把表达式改成恒真即可，无需改镜像。
+#
+# ⚠️ 安全性：设置页含 API Key，开启后任何能访问此地址的人都能读写它。
+# ---------------------------------------------------------------------------
+apply_remote_settings_patch() {
+  local target patched=0
+  for target in \
+    /src/packages/client/ui-settings/lib/client.js \
+    /src/packages/client/ui-settings-general/lib/client.js \
+    /src/node_modules/@deepseek-ai/dsh-client-ui-settings/lib/client.js \
+    /src/node_modules/@deepseek-ai/dsh-client-ui-settings-general/lib/client.js
+  do
+    [ -f "${target}" ] || continue
+    grep -q 'isLoopback' "${target}" 2>/dev/null || continue
+    if sed -i 's/ctx\.remote\.\$host\.isLoopback/true/g' "${target}" 2>/dev/null; then
+      echo "[dshdocker] 已解除 loopback 门控: ${target}"
+      patched=$((patched + 1))
+    else
+      echo "[dshdocker] 警告: 无法改写 ${target}（权限不足？）"
+    fi
+  done
+  [ "${patched}" -gt 0 ] || echo "[dshdocker] 警告: 未找到可打补丁的客户端插件文件"
+}
+
+if [[ "${DSH_ALLOW_REMOTE_SETTINGS:-0}" == "1" ]]; then
+  apply_remote_settings_patch
+  echo "[dshdocker] ⚠️  已放开远程设置读写：任何能访问本地址的人都能查看/修改 API Key"
+else
+  echo "[dshdocker] 设置页保持 upstream 默认（仅 127.0.0.1/localhost 可用）"
+fi
 
 # 传了参数就完全交给用户（例如：--profile headless "任务"），不启动 web 与转发器
 if [[ $# -gt 0 ]]; then

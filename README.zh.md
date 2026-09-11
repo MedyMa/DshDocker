@@ -137,7 +137,7 @@ const persistence = ctx.remote.$host.isLoopback ? "host" : "memory";
 | `http://192.168.x.x:3080` | ✅ | ❌ |
 | `https://<穿透域名>` | ✅ | ❌ |
 
-这是上游**有意的安全设计**（设置里含 API Key）。配置模型有两条路：
+这是上游**有意的安全设计**（设置里含 API Key）。有三条路：
 
 **A. SSH 本地转发，让浏览器变成 loopback（推荐）**
 
@@ -194,6 +194,28 @@ API Key 用环境变量传入（名字取自 provider 的 `apiKeyEnv`）：
 -e MY_PROVIDER_API_KEY=xxxxxxxx
 ```
 
+**C. 解除限制：让任意来源都能用设置页（`DSH_ALLOW_REMOTE_SETTINGS=1`）**
+
+本镜像内置了这个开关：启动时把客户端里那两处 loopback 判断改成恒真，
+于是**穿透域名/局域网 IP 也能正常打开「模型」「插件」设置页**。
+
+```bash
+docker rm -f dsh
+docker run -d --name dsh --restart unless-stopped --network host \
+  -v dsh-home:/home/node/.dsh -v "$PWD/workspace:/workspace" \
+  -e DSH_TRUSTED_HOSTS="192.168.2.1,dsh.example.com" \
+  -e DSH_ALLOW_REMOTE_SETTINGS=1 \
+  -e DEEPSEEK_API_KEY=sk-xxxxxxxx \
+  ghcr.io/medyma/dshdocker:latest
+```
+
+> ⚠️ **安全性代价**：这等于去掉 upstream 的一层保护 —— 设置页里有 API Key，
+> 开启后**任何能访问该地址的人都能查看/修改它**。穿透地址是公网域名时风险实在，请自行评估。
+>
+> 补丁只在容器**运行时**作用于客户端插件（`ui-settings` / `ui-settings-general` 的
+> `lib/client.js`），不改变镜像内容；关闭该开关即恢复 upstream 行为。
+> 生效后浏览器需**强制刷新**（Ctrl+Shift+R）以丢弃旧的插件缓存。
+
 ---
 
 ## 配置
@@ -205,6 +227,7 @@ API Key 用环境变量传入（名字取自 provider 的 `apiKeyEnv`）：
 | `DSH_PORT` | `3080` | 容器内对外暴露 / 转发器监听端口 |
 | `DSH_WEB_INTERNAL_PORT` | `30801` | `dsh web` 内部绑定的 loopback 端口 |
 | `DSH_TRUSTED_HOSTS` | 空 | 逗号分隔的可信 authority，供 `/api` 围栏校验。**非 localhost 访问必填。** 不带端口 = 匹配任意端口 |
+| `DSH_ALLOW_REMOTE_SETTINGS` | `0` | `=1` 解除「设置页仅 loopback 可用」的限制（见上文 C）。⚠️ 会暴露 API Key 的读写权限 |
 | `DSH_BIN` | `/src/apps/cli/lib/bin.js` | 源码构建出的 CLI 入口 |
 | `DSH_HOME` | `/home/node/.dsh` | DSH 数据根目录（凭证 / 设置 / 会话 / profile）|
 | `DSH_TELEMETRY_DISABLED` | `1` | 关闭遥测 |
