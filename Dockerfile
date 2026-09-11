@@ -95,9 +95,14 @@ COPY --from=builder /src /src
 # 非 root 运行：直接用基础镜像自带的 node 用户（UID/GID 1000）。
 # 注意：不要 useradd -u 1000 自建用户 —— node 镜像里 UID 1000 已被 node 占用，
 # 会以 "UID 1000 is not unique" 失败（exit code 4）。
+#
+# 关于 DSH_HOST：DSH 的 web 只允许绑定 127.0.0.1
+#   - dsh-web-app/startup.js 拒绝 --host 0.0.0.0
+#   - dsh-host-webserver 的 schema 仅接受 "127.0.0.1" | "0.0.0.0"
+# 因此容器内 dsh 固定听 loopback，由 dsh-forward.js 在 0.0.0.0 上转发。
 ENV DSH_HOME=/home/node/.dsh \
-    DSH_HOST=0.0.0.0 \
     DSH_PORT=3080 \
+    DSH_WEB_INTERNAL_PORT=30801 \
     DSH_TELEMETRY_DISABLED=1 \
     DSH_BIN=/src/apps/cli/lib/bin.js
 
@@ -105,7 +110,8 @@ RUN mkdir -p /workspace "${DSH_HOME}" \
  && chown -R node:node /workspace "${DSH_HOME}"
 
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
-RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+COPY dsh-forward.js /usr/local/bin/dsh-forward.js
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh /usr/local/bin/dsh-forward.js
 
 VOLUME ["/home/node/.dsh", "/workspace"]
 WORKDIR /workspace

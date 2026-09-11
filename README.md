@@ -14,9 +14,39 @@ ghcr.io/medyma/dshdocker:latest
 
 ---
 
-## Quick start
+## ⚠️ Read this first: DSH's web server is loopback-only
 
-### Docker run
+Upstream deliberately restricts the Web GUI:
+
+| Location | Rule |
+|---|---|
+| `dsh-web-app/startup.js` | rejects `--host 0.0.0.0` outright ("would expose remote code execution to the network") |
+| `dsh-host-webserver` config | `host: z.union([z.const("127.0.0.1"), z.const("0.0.0.0")])` — **only those two values are legal** |
+
+Since `0.0.0.0` is rejected at startup and every other value fails the schema,
+**`127.0.0.1` is the only bindable host**. A container port mapping (`-p`) DNATs to the
+container's `eth0`, *not* to loopback — so this image runs a **tiny TCP forwarder**
+(`dsh-forward.js`) inside the container:
+
+```
+0.0.0.0:3080  ──forward──▶  127.0.0.1:30801  (dsh web)
+        ▲
+        └── docker -p 3080:3080
+```
+
+The forwarder is a raw TCP relay: it **does not rewrite any header**, so DSH's
+Host/Origin fence and its authority-bound cookie keep working on the original authority.
+
+### Consequences
+
+1. **`DSH_TRUSTED_HOSTS` is mandatory** for any non-localhost access. DSH auto-trusts LAN IP
+   literals only when bound to `0.0.0.0` — which is impossible — so LAN IPs are **not**
+   trusted implicitly. Declare whatever you browse with.
+2. **You need a one-time `?token=` visit** to obtain the session cookie (see below).
+
+---
+
+## Quick start
 
 ```bash
 docker run -d --name dsh \
@@ -24,67 +54,77 @@ docker run -d --name dsh \
   -p 3080:3080 \
   -v dsh-home:/home/node/.dsh \
   -v "$PWD/workspace:/workspace" \
-  -e DSH_TRUSTED_HOSTS="192.168.1.10:3080" \
+  -e DSH_TRUSTED_HOSTS="192.168.1.10,dsh.example.com" \
   ghcr.io/medyma/dshdocker:latest
 ```
 
-Then open `http://<your-host>:3080`.
+Then see **[Getting access](#getting-access)** below — a bare `http://host:3080` will return
+`401 unauthorized` until you complete the token exchange.
 
 ### Docker Compose
+
+Edit `DSH_TRUSTED_HOSTS` in `docker-compose.yml`, then:
 
 ```bash
 docker compose up -d
 ```
 
-Edit `DSH_TRUSTED_HOSTS` in `docker-compose.yml` to match **the address you actually
-browse with** (`IP:port` or `hostname:port`).
-
 ---
 
-## Image tags
+## Getting access
 
-| Tag | Meaning |
-|---|---|
-| `latest` | Newest upstream `master` built by this repo |
-| `0.1.5-rc.2` | Upstream `package.json` version at build time |
-| `sha-<short>` | Upstream commit that was built (**most precise**) |
-| `v1.0.0` | Git tag pushed to *this* repo |
+DSH Web has **two gates**, both enforced on `/api`:
 
-Because images come from source, `sha-<short>` is the tag to pin when you want exactly
-one upstream commit.
+| Gate | Failure | Cause | Fix |
+|---|---|---|---|
+| Host/Origin trust fence | **403 forbidden** | the authority you browse with is not in `trustedHosts` | add it to `DSH_TRUSTED_HOSTS` |
+| Browser-session auth | **401 unauthorized** | no session cookie | visit `/?token=…` once |
 
----
-
-## Build args (local builds)
-
-| Arg | Default | Description |
-|---|---|---|
-| `DSH_REPO` | `https://github.com/deepseek-ai/deepseek-harness.git` | Upstream repo (point at a mirror if needed) |
-| `DSH_REF` | `master` | Branch, tag, or commit SHA to build |
-| `DSH_BUILD_SCRIPT` | `build` | pnpm script to run; `build:official` matches upstream's release profile |
-| `NODE_VERSION` | `24` | Node base image (upstream CI uses 24; `engines` requires `^22.19.0 \|\| >=24.0.0`) |
-| `PNPM_VERSION` | `11.7.0` | pnpm version via corepack (matches upstream `packageManager`) |
+Flow:
 
 ```bash
-# latest master
-docker build -t dshdocker .
+# 1. take the launch token from the container log
+docker logs dsh 2>&1 | grep 'dsh web:'
+#    dsh web: http://127.0.0.1:30801/?token=XXXXXX
 
-# a specific release tag
-docker build --build-arg DSH_REF=v0.1.5-rc.2 -t dshdocker .
-
-# a specific commit (most reproducible)
-docker build --build-arg DSH_REF=<commit-sha> -t dshdocker .
-
-# arm64
-docker buildx build --platform linux/arm64 -t dshdocker .
+# 2. exchange it for a cookie — use YOUR authority, not 127.0.0.1
+#    http://192.168.1.10:3080/?token=XXXXXX
+#    or through a tunnel:
+#    https://dsh.example.com/?token=XXXXXX
 ```
 
-> The build is heavy: `pnpm run build` runs `build:native-system` (native Landlock addon,
-> needs `musl-gcc`) → `build:lib` (`tsc` with a 4 GB heap) → `build:web`. Expect a long
-> build and several GB of build cache.
->
-> Behind the GFW? Set `DSH_REPO` to a GitHub mirror, or pass a proxy:
-> `--build-arg HTTP_PROXY=... --build-arg HTTPS_PROXY=...`
+That returns `303 → /` plus a `Set-Cookie`, after which the UI loads normally.
+
+Notes:
+
+- The cookie is **bound to the authority** (host:port). Changing host or port requires the
+  token exchange again.
+- The launch token is **regenerated on every process start** — after `docker restart` you
+  need a fresh token.
+- `sec-fetch-site: cross-site` is rejected: open the URL directly, don't embed it in an iframe
+  or navigate from another site.
+
+### LAN access
+
+Add the IP/host you browse with:
+
+```bash
+-e DSH_TRUSTED_HOSTS="192.168.2.1"          # port-less: matches any port (recommended)
+-e DSH_TRUSTED_HOSTS="192.168.2.1:3080"     # or pin an exact authority
+```
+
+### Remote access / reverse proxy / tunnel (内网穿透)
+
+1. **Include the public domain** in `DSH_TRUSTED_HOSTS`
+   (port-less is easiest, e.g. `dsh.example.com`).
+2. **Preserve the original `Host` header** in your proxy:
+   - `frp` — preserved by default ✅
+   - nginx — `proxy_set_header Host $host;`
+3. **Enable WebSocket upgrade** — the RPC bridge uses WS; without it the page loads but hangs.
+4. Then complete the `?token=` exchange **on the public URL**.
+
+> If your proxy rewrites `Host` to `127.0.0.1:30801`, the fence passes as loopback, but the
+> browser's `Origin` will no longer match — declare the real authority instead.
 
 ---
 
@@ -94,77 +134,75 @@ docker buildx build --platform linux/arm64 -t dshdocker .
 
 | Variable | Default | Description |
 |---|---|---|
-| `DSH_BIN` | `/src/apps/cli/lib/bin.js` | CLI entry point produced by the source build |
-| `DSH_HOST` | `0.0.0.0` | Bind host for the web UI |
-| `DSH_PORT` | `3080` | Listen port |
-| `DSH_TRUSTED_HOSTS` | *(empty)* | Comma-separated extra authorities accepted by the `/api` browser-trust fence. **Required when you access the UI from anything other than localhost.** e.g. `192.168.1.10:3080,dsh.local:3080` |
+| `DSH_PORT` | `3080` | Exposed / forwarder listen port inside the container |
+| `DSH_WEB_INTERNAL_PORT` | `30801` | Internal loopback port the `dsh web` server binds |
+| `DSH_TRUSTED_HOSTS` | *(empty)* | Comma-separated authorities accepted by the `/api` fence. **Required for any non-localhost access.** Port-less entries match any port. |
+| `DSH_BIN` | `/src/apps/cli/lib/bin.js` | CLI entry produced by the source build |
 | `DSH_HOME` | `/home/node/.dsh` | DSH data root (credentials, settings, sessions, profiles) |
 | `DSH_TELEMETRY_DISABLED` | `1` | Disable telemetry |
+
+> There is deliberately **no `DSH_HOST`**: DSH cannot bind anything but loopback.
 
 ### Volumes
 
 | Path | Purpose |
 |---|---|
-| `/home/node/.dsh` | **Persist this.** Credentials, settings, sessions, profiles, storages. |
+| `/home/node/.dsh` | **Persist this.** Credentials, settings, sessions, profiles. |
 | `/workspace` | Working directory DSH reads/writes and runs commands in |
 
-> The container runs as the base image's **`node` user (UID/GID 1000)** — not root.
-> For bind mounts: `sudo chown -R 1000:1000 ./data ./workspace`
+> The container runs as the base image's **`node` user (UID/GID 1000)**. For bind mounts:
+> `sudo chown -R 1000:1000 ./data ./workspace`
 
 ### Running other modes
 
-The entrypoint runs `dsh web` by default; **any arguments are forwarded to the CLI**:
+Any arguments are forwarded straight to the CLI (the web server and forwarder are skipped):
 
 ```bash
-# headless: run one task, print the answer, exit
 docker run --rm -v dsh-home:/home/node/.dsh \
   ghcr.io/medyma/dshdocker:latest --profile headless "summarize /workspace/notes.txt"
-
-# shell inside the container
-docker run --rm -it --entrypoint bash ghcr.io/medyma/dshdocker:latest
 ```
+
+---
+
+## Image tags
+
+| Tag | Meaning |
+|---|---|
+| `latest` | Newest upstream `master` built by this repo |
+| `0.1.5-rc.2` | Upstream `package.json` version at build time |
+| `sha-<short>` | Upstream commit that was built (**most precise** — use this to pin) |
+
+---
+
+## Build args (local builds)
+
+| Arg | Default | Description |
+|---|---|---|
+| `DSH_REPO` | `https://github.com/deepseek-ai/deepseek-harness.git` | Upstream repo (point at a mirror if needed) |
+| `DSH_REF` | `master` | Branch, tag, or commit SHA |
+| `DSH_BUILD_SCRIPT` | `build` | pnpm script; `build:official` matches upstream's release profile |
+| `NODE_VERSION` | `24` | Node base image (upstream CI uses 24) |
+| `PNPM_VERSION` | `11.7.0` | pnpm version via corepack |
+
+```bash
+docker build -t dshdocker .
+docker build --build-arg DSH_REF=<commit-sha> -t dshdocker .
+docker buildx build --platform linux/arm64 -t dshdocker .
+```
+
+The build is heavy: `build:native-system` (needs `musl-gcc`) → `build:lib` (tsc, 4 GB heap) →
+`build:web`.
 
 ---
 
 ## CI
 
-`.github/workflows/docker.yml`:
+`.github/workflows/docker.yml`: **resolve** (shallow-clone upstream, read version, compute tags,
+skip when the `sha-<short>` image already exists) → **build** (native matrix: `ubuntu-24.04` for
+amd64, `ubuntu-24.04-arm` for arm64, pushed by digest) → **merge** (one multi-arch manifest).
 
-1. **resolve** — shallow-clones upstream at the requested ref, reads `package.json`
-   for the version, computes tags (`latest` / `<version>` / `sha-<short>`), and on
-   scheduled runs **skips the build if that `sha-<short>` image already exists**.
-2. **build** — a matrix of **native runners**: `ubuntu-24.04` for `linux/amd64` and
-   `ubuntu-24.04-arm` for `linux/arm64`. Each pushes **by digest** (no QEMU, so the
-   heavy TypeScript/frontend build stays fast).
-3. **merge** — collects the digests and creates one multi-arch manifest with all tags.
-
-Daily schedule means you get new upstream commits automatically, without rebuilding
-when nothing changed.
-
-> The `ubuntu-24.04-arm` runner is free for **public** repositories. If your fork is
-> private, either make it public or replace that matrix entry with a QEMU build
-> (`platforms: linux/arm64` on `ubuntu-24.04`) and accept the slower build.
-
----
-
-## Notes & caveats
-
-1. **GHCR packages are private by default.** After the first successful run:
-   *GitHub → your profile → Packages → dshdocker → Package settings → Change visibility*
-   → **public**.
-2. **Image size.** This builds the whole upstream monorepo and ships it, so the image is
-   large (multiple GB). If you only need a small runtime, the npm-install flavour of
-   this image is far leaner — source builds trade size for fidelity/reproducibility.
-3. **`DSH_TRUSTED_HOSTS` matters.** DSH's web app has a browser-trust fence on `/api`;
-   LAN IP / domain access is rejected unless listed.
-4. **First run needs model credentials.** Stored under `DSH_HOME` — mount a volume.
-5. **Sandbox / Landlock.** DSH uses a Landlock-based confinement helper. Docker's default
-   seccomp profile may block those syscalls; DSH degrades gracefully, but if you want the
-   sandbox try `--security-opt seccomp=unconfined`.
-6. **Behind a proxy?** Set `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` for the container so
-   it can reach your model API.
-7. **Unofficial.** Community packaging of an official open-source project. Not affiliated
-   with DeepSeek.
+All actions are pinned to majors whose `action.yml` declares `runs.using: node24` — no
+Node 20 deprecation warnings.
 
 ---
 

@@ -11,10 +11,13 @@ services:
     ports:
       - "3080:3080"
     environment:
-      DSH_HOST: "0.0.0.0"
       DSH_PORT: "3080"
-      # 非 localhost 访问必须填这里，否则 /api 的浏览器信任围栏会拒绝请求
-      DSH_TRUSTED_HOSTS: "192.168.1.10:3080,dsh.local:3080"
+      # 内部 loopback 端口（转发器指向它），一般不用改
+      DSH_WEB_INTERNAL_PORT: "30801"
+      # 【必填】你不是用 localhost 访问，就必须在这里声明你访问用的 authority。
+      # DSH 只允许绑 loopback，且 IP 字面量不会自动信任，所以必须显式声明。
+      # 不带端口 = 匹配该主机名的任意端口（推荐）；可逗号并列多个。
+      DSH_TRUSTED_HOSTS: "192.168.2.1,dsh.example.com"
       DSH_TELEMETRY_DISABLED: "1"
       TZ: "Asia/Shanghai"
     volumes:
