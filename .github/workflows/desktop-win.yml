@@ -153,6 +153,29 @@ jobs:
           echo "HEAD     = $(git rev-parse HEAD)"
           echo "expected = ${SHA}"
 
+      # 上游遗留问题：桌面运行时冒烟测试仍然断言 fs-ext 可加载，但 fs-ext
+      # 早已不是依赖 —— 上游设计笔记（2026-09-07-prebuilt-system-primitives）
+      # 说明它已被 @deepseek-ai/node-addon-system（稳定 Node-API、预编译）取代，
+      # 且「Windows 保留既有 koffi 信号量」。仓库里没有任何运行时代码 require
+      # fs-ext，也没有任何 package.json / lockfile / vendor 声明它；上游公开 CI
+      # 又从不打包桌面版，所以这条陈旧断言一直没被清理，会以
+      #   Error: Cannot find module 'fs-ext'
+      #   Error: desktop package: pnpm run prepare:dsh exited with 1
+      # 阻断 Windows 打包。这里把它注释掉，并在缺失时显式失败以便将来更新。
+      - name: Work around the stale fs-ext assertion
+        shell: bash
+        working-directory: upstream
+        run: |
+          set -euo pipefail
+          F="apps/desktop/tests/fixtures/runtime-payload-smoke.mjs"
+          if ! grep -q '^  checkFsExt()$' "$F"; then
+            echo "::error::上游已修改冒烟测试，不再以 '  checkFsExt()' 调用；请重新评估本 workaround"
+            grep -n 'checkFsExt' "$F" || true
+            exit 1
+          fi
+          sed -i 's|^  checkFsExt()$|  // DshDocker: fs-ext 已不是依赖（改用 @deepseek-ai/node-addon-system；Windows 用 koffi），跳过陈旧断言|' "$F"
+          grep -n 'DshDocker:' "$F"
+
       - name: Install dependencies
         working-directory: upstream
         run: pnpm install --frozen-lockfile
