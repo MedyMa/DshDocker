@@ -1,0 +1,217 @@
+name: Build DSH Desktop (Windows, unsigned)
+
+# 从上游源码构建 DeepSeek Harness 桌面端（Electron）的 Windows x64 **未签名**安装包。
+#
+# 为什么只做 Windows 未签名：
+#   - 上游只给 win-x64 提供了 --unsigned 通道（package-target.ts:  "--unsigned requires win-x64"）
+#   - macOS 打包**强制**要求 Apple 签名身份 + Team ID + 公证凭据，没有开发者账号根本打不出来
+#     （electron-builder.config.mjs 对 macOS 必定调用 resolveMacOSNotarizationEnvironment）
+#   - Windows 正式签名需要 GlobalSign EV 证书 + SafeNet USB Token + PIN，
+#     只能在连接物理 Token 的自托管 runner 上做，托管 runner 无解
+#
+# 触发：手动 / 每天定时检查上游新版本 / 本 workflow 变更时
+# 产物：GitHub Release（tag: desktop-v<版本>）+ Actions Artifacts
+#
+# 约定：所有 action 使用原生基于 Node 24 的大版本（已逐个核对 runs.using）：
+#   actions/checkout@v7  actions/setup-node@v7  actions/upload-artifact@v7
+#   pnpm/action-setup@v6
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/desktop-win.yml"
+  schedule:
+    - cron: "30 2 * * *" # UTC 02:30 = 北京时间 10:30（比 Docker 那条晚半小时）
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "上游 ref（分支/标签/commit），留空 = master"
+        required: false
+        default: ""
+      force:
+        description: "强制重建（忽略“该版本已存在”检查）"
+        type: boolean
+        required: false
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UPSTREAM_REPO: https://github.com/deepseek-ai/deepseek-harness.git
+  NODE_VERSION: "24"
+  PNPM_VERSION: "11.7.0"
+  # Electron 应用 ID，必须是反向域名形式。
+  # 想改的话在仓库 Settings → Variables 里加一个 DSH_DESKTOP_APP_ID。
+  APP_ID: ${{ vars.DSH_DESKTOP_APP_ID || 'com.medyma.dsh' }}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 解析上游版本，判断是否需要构建
+  # ---------------------------------------------------------------------------
+  resolve:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      ref: ${{ steps.r.outputs.ref }}
+      sha: ${{ steps.r.outputs.sha }}
+      version: ${{ steps.r.outputs.version }}
+      tag: ${{ steps.r.outputs.tag }}
+      should_build: ${{ steps.r.outputs.should_build }}
+    steps:
+      - name: Resolve upstream ref
+        id: r
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REF_INPUT: ${{ github.event.inputs.ref }}
+          FORCE: ${{ github.event.inputs.force }}
+        run: |
+          set -euo pipefail
+          REF="${REF_INPUT:-master}"
+          echo "::notice::upstream ref = ${REF}"
+
+          rm -rf upstream && mkdir upstream && cd upstream
+          git init -q .
+          git remote add origin "${UPSTREAM_REPO}"
+          git fetch -q --depth 1 origin "${REF}"
+          git checkout -q FETCH_HEAD
+
+          SHA="$(git rev-parse HEAD)"
+          VERSION="$(node -p "require('./package.json').version")"
+          TAG="desktop-v${VERSION}"
+          echo "::notice::upstream ${SHA} (version ${VERSION})"
+
+          SHOULD="true"
+          if [ "${FORCE:-false}" != "true" ]; then
+            if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+              echo "::notice::release ${TAG} 已存在，跳过构建"
+              SHOULD="false"
+            fi
+          fi
+
+          {
+            echo "ref=${REF}"
+            echo "sha=${SHA}"
+            echo "version=${VERSION}"
+            echo "tag=${TAG}"
+            echo "should_build=${SHOULD}"
+          } >> "$GITHUB_OUTPUT"
+          echo "should_build = ${SHOULD}"
+
+  # ---------------------------------------------------------------------------
+  # Windows x64 未签名打包
+  # ---------------------------------------------------------------------------
+  build-win:
+    needs: resolve
+    if: needs.resolve.outputs.should_build == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 120
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v7
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Toolchain check
+        shell: bash
+        run: |
+          node --version
+          pnpm --version
+          python --version || python3 --version
+          echo "APP_ID=${APP_ID}"
+
+      - name: Clone upstream at the resolved commit
+        shell: bash
+        env:
+          SHA: ${{ needs.resolve.outputs.sha }}
+          REF: ${{ needs.resolve.outputs.ref }}
+        run: |
+          set -euo pipefail
+          rm -rf upstream
+          git init -q upstream
+          cd upstream
+          git remote add origin "${UPSTREAM_REPO}"
+          # 优先按 commit 拉（最可复现）；失败再按 ref 拉
+          if ! git fetch -q --depth 1 origin "${SHA}"; then
+            echo "按 commit 拉取失败，回退到 ref=${REF}"
+            git fetch -q --depth 1 origin "${REF}"
+          fi
+          git checkout -q FETCH_HEAD
+          echo "HEAD     = $(git rev-parse HEAD)"
+          echo "expected = ${SHA}"
+
+      - name: Install dependencies
+        working-directory: upstream
+        run: pnpm install --frozen-lockfile
+
+      - name: Package Windows x64 (unsigned)
+        working-directory: upstream
+        env:
+          DSH_DESKTOP_APP_ID: ${{ env.APP_ID }}
+        run: pnpm run package:desktop:win:x64:unsigned
+
+      - name: List artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          DIR="upstream/apps/desktop/.desktop-build/targets/win-x64/unsigned-artifacts"
+          if [ ! -d "$DIR" ]; then echo "::error::未找到产物目录 $DIR"; exit 1; fi
+          echo "产物目录: $DIR"
+          find "$DIR" -type f -printf '%s\t%p\n' | sort -k2
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: dsh-desktop-win-x64-unsigned-${{ needs.resolve.outputs.version }}
+          path: upstream/apps/desktop/.desktop-build/targets/win-x64/unsigned-artifacts/*
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          SHA: ${{ needs.resolve.outputs.sha }}
+          APP_ID: ${{ env.APP_ID }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          FILES=(upstream/apps/desktop/.desktop-build/targets/win-x64/unsigned-artifacts/*)
+          if [ ${#FILES[@]} -eq 0 ]; then echo "::error::没有可发布的产物"; exit 1; fi
+
+          PRERELEASE=""
+          case "${VERSION}" in *-*) PRERELEASE="--prerelease" ;; esac
+
+          NOTES="DeepSeek Harness 桌面端 **Windows x64** 安装包"
+          NOTES="${NOTES}"$'\n\n'"- 上游版本: \`${VERSION}\`"
+          NOTES="${NOTES}"$'\n'"- 上游提交: \`${SHA}\`"
+          NOTES="${NOTES}"$'\n'"- 应用 ID: \`${APP_ID}\`"
+          NOTES="${NOTES}"$'\n'"- **未签名**：Windows SmartScreen 会提示未知发布者，安装时选「更多信息 → 仍要运行」"
+          NOTES="${NOTES}"$'\n'"- 未签名包不含自动更新配置，属本地安装测试用途"
+          NOTES="${NOTES}"$'\n\n'"由 DshDocker 的 desktop-win workflow 自动构建。"
+
+          if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "release ${TAG} 已存在，追加/覆盖产物"
+            gh release upload "${TAG}" "${FILES[@]}" --clobber --repo "${GITHUB_REPOSITORY}"
+          else
+            gh release create "${TAG}" "${FILES[@]}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "DSH Desktop ${VERSION} (Windows x64, unsigned)" \
+              --notes "${NOTES}" ${PRERELEASE}
+          fi
+          echo "::notice::已发布 ${TAG}"
