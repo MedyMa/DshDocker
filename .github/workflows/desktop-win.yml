@@ -24,6 +24,7 @@ on:
     branches: [main]
     paths:
       - ".github/workflows/desktop-win.yml"
+      - ".github/scripts/**"
   schedule:
     - cron: "30 2 * * *" # UTC 02:30 = 北京时间 10:30（比 Docker 那条晚半小时）
   workflow_dispatch:
@@ -51,6 +52,27 @@ env:
   APP_ID: ${{ vars.DSH_DESKTOP_APP_ID || 'com.medyma.dsh' }}
 
 jobs:
+  # ---------------------------------------------------------------------------
+  # 架构校验器自测：不依赖上游、不依赖产物，约 2 秒。
+  # 单独成一个 job 是有意的 —— 该版本 Release 已存在时 build-win 会被整段跳过，而那正是
+  # 定时任务的常见路径；若把自测放在 build-win 里，闸门本身在最常见的路径下反而没人验证。
+  # ---------------------------------------------------------------------------
+  guard-selftest:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v7
+
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Self-test the artifact verifier
+        run: node .github/scripts/verify-win-artifacts.test.mjs
+
   # ---------------------------------------------------------------------------
   # 解析上游版本，判断是否需要构建
   # ---------------------------------------------------------------------------
@@ -108,7 +130,7 @@ jobs:
   # Windows x64 未签名打包
   # ---------------------------------------------------------------------------
   build-win:
-    needs: resolve
+    needs: [resolve, guard-selftest]
     if: needs.resolve.outputs.should_build == 'true'
     runs-on: windows-latest
     timeout-minutes: 120
@@ -135,11 +157,6 @@ jobs:
           pnpm --version
           python --version || python3 --version
           echo "APP_ID=${APP_ID}"
-
-      # 自测架构校验器本身：8 个用例（含真实产物形态，以及主程序/node.exe 为 32 位或
-      # ARM64 的反例）。跑得很快，放在最前面，避免校验器自身出问题却只在收尾时才暴露。
-      - name: Self-test the artifact verifier
-        run: node .github/scripts/verify-win-artifacts.test.mjs
 
       - name: Clone upstream at the resolved commit
         shell: bash
