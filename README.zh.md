@@ -407,6 +407,55 @@ Actions → 点开那条失败的 run → 看红叉 job 的日志。常见三类
 
 ---
 
+## 桌面端 App（Windows x64，未签名）
+
+除了网页版，本仓库也会从上游源码自动构建 **Electron 桌面端**的 Windows x64 安装包。
+
+**下载**：GitHub → Releases → 找 `desktop-v<版本>`（如 `desktop-v0.1.5-rc.2`）；
+或在该次构建的 Actions 页面下载 Artifacts（保留 30 天）。
+
+### 为什么只有 Windows
+
+| 目标 | 托管 runner 能否构建 | 原因 |
+|---|---|---|
+| **Windows x64（未签名）** | ✅ | 上游只给 `win-x64` 开了 `--unsigned` 通道 |
+| Windows 正式签名 | ❌ | 需要 GlobalSign EV 证书 + SafeNet USB Token（物理设备），只能自托管 runner |
+| macOS（Intel / Apple Silicon）| ❌ | 上游**强制**要求 Apple 签名身份 + Team ID + 公证凭据，没有开发者账号打不出来 |
+
+### 一定是 64 位
+
+安装包文件名形如 `deepseek-harness-0.1.5-rc.2-win-x64.exe`（`x64` = 64 位；32 位会叫 `ia32`，
+未打包目录也会变成 `win-ia32-unpacked`）。
+
+上游源码里本来就没有 32 位通道：`desktop-build-paths.mjs` 的 `SUPPORTED_TARGETS` 只有
+`mac-arm64 / mac-x64 / win-x64`；`package-target.ts` 的 `win-x64` 硬编码 `arch: 'x64'`，
+并强制要求 Windows x64 构建主机。
+
+构建流程里再加一道二进制级闸门（`.github/scripts/verify-win-artifacts.mjs`）：
+**主程序** 与 **随包分发的 `node.exe`** 的 PE 头 Machine 必须是 `AMD64 (0x8664)`，否则构建失败。
+该闸门自身有回归测试（`verify-win-artifacts.test.mjs`，8 个用例），构建前先自测。
+
+> **一个容易被误会的点**：安装包外壳本身是 32 位 PE。NSIS 只有 32 位实现，electron-builder 打出的
+> `.exe` 永远是 i386 引导程序 —— **这与安装后的应用位数无关**，真正运行的是纯 64 位 Electron + 64 位 `node.exe`。
+>
+> 另外，应用内部合法地带着少量非 x64 的附带程序（`runtime/pnpm/dist/vendor/fastlist-0.3.0-x86.exe`、
+> `node-pty/third_party/conpty/<版本>/win10-arm64/OpenConsole.exe`），它们是 pnpm 与 node-pty 自带的多架构
+> payload，校验器对它们只告警、不失败。
+
+### 安装注意
+
+- **未签名**：SmartScreen 会提示「Windows 已保护你的电脑」，选「更多信息 → 仍要运行」。
+- 未签名包不含自动更新配置，属本地安装测试用途。
+
+### 手动触发与定时
+
+Actions → **Build DSH Desktop (Windows, unsigned)** → Run workflow。`ref` 留空即用上游 `master`；
+勾上 `force` 则忽略「该版本 Release 已存在」检查。
+
+定时任务每天 UTC 02:30（北京时间 **10:30**）检查上游新版本；该版本的 Release 已存在则跳过。
+
+---
+
 ## 许可
 
 [MIT](LICENSE)。DeepSeek Harness 本身遵循其作者自己的许可。

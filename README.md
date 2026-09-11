@@ -422,6 +422,59 @@ Re-run: Actions → that run → **Re-run jobs** (top right).
 
 ---
 
+## Desktop app (Windows x64, unsigned)
+
+Besides the web build, this repo also builds the **Electron desktop app** for Windows x64
+from upstream source, automatically.
+
+**Download**: GitHub → Releases → look for `desktop-v<version>` (e.g. `desktop-v0.1.5-rc.2`),
+or grab the Artifacts of that run (kept for 30 days).
+
+### Why Windows only
+
+| Target | Buildable on hosted runners | Reason |
+|---|---|---|
+| **Windows x64 (unsigned)** | ✅ | upstream only exposes an `--unsigned` path for `win-x64` |
+| Windows, signed | ❌ | needs a GlobalSign EV certificate **and** a SafeNet USB token (physical), so self-hosted runners only |
+| macOS (Intel / Apple Silicon) | ❌ | upstream **requires** an Apple signing identity + Team ID + notarization credentials; impossible without a developer account |
+
+### It is always 64-bit
+
+The installer is named `deepseek-harness-0.1.5-rc.2-win-x64.exe` (`x64` = 64-bit; a 32-bit build
+would be `ia32`, and the unpacked directory would be `win-ia32-unpacked`).
+
+Upstream has no 32-bit path at all: `desktop-build-paths.mjs` lists only
+`mac-arm64 / mac-x64 / win-x64` in `SUPPORTED_TARGETS`, and `package-target.ts` hard-codes
+`arch: 'x64'` for `win-x64` while requiring a Windows x64 build host.
+
+On top of that, the workflow enforces a binary-level gate
+(`.github/scripts/verify-win-artifacts.mjs`): the PE header `Machine` field of both the
+**main executable** and the **bundled `node.exe`** must be `AMD64 (0x8664)`, or the build fails.
+The gate has its own regression test (`verify-win-artifacts.test.mjs`, 8 cases) run before packaging.
+
+> **Easily misunderstood**: the installer *shell* is itself a 32-bit PE. NSIS has no 64-bit
+> implementation, so electron-builder's `.exe` is always an i386 bootstrap — **that says nothing
+> about the installed app**, which is a pure 64-bit Electron runtime plus a 64-bit `node.exe`.
+>
+> The app also legitimately ships a few non-x64 companion binaries
+> (`runtime/pnpm/dist/vendor/fastlist-0.3.0-x86.exe`,
+> `node-pty/third_party/conpty/<version>/win10-arm64/OpenConsole.exe`) — they are pnpm's and
+> node-pty's own multi-arch payloads, so the gate only warns about them instead of failing.
+
+### Installing
+
+- **Unsigned**: SmartScreen will warn about an unknown publisher — choose “More info → Run anyway”.
+- An unsigned package carries no auto-update configuration; it is meant for local install testing.
+
+### Triggering it
+
+Actions → **Build DSH Desktop (Windows, unsigned)** → Run workflow. Leave `ref` empty to use
+upstream `master`; tick `force` to ignore the “release already exists” check.
+
+A daily job runs at UTC 02:30 (10:30 Beijing time) and skips versions whose release already exists.
+
+---
+
 ## License
 
 [MIT](LICENSE). DeepSeek Harness itself is licensed by its own authors.
