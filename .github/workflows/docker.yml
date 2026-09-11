@@ -1,0 +1,238 @@
+name: Build & Push DSH Image (from source)
+
+# 从 DeepSeek Harness 官方源码构建镜像。
+#
+# 触发：
+#   - push 到 main / 打 v* tag
+#   - 每天定时检查上游 master 是否有新提交（有新 commit 才构建）
+#   - 手动触发，可指定 ref（分支/标签/commit）与强制重建
+#
+# 构建策略：
+#   上游是重型 pnpm monorepo（tsc + 前端 + 原生插件），
+#   所以在原生 runner 上分别构建 amd64 / arm64，再合并成一个多架构 manifest。
+#   （避免 QEMU 模拟 arm64 跑几十分钟~几小时）
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  schedule:
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "上游 ref（分支/标签/commit），留空 = master"
+        required: false
+        default: ""
+      force:
+        description: "强制重建（忽略“镜像已存在”检查）"
+        type: boolean
+        required: false
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  UPSTREAM_REPO: https://github.com/deepseek-ai/deepseek-harness.git
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 解析上游源码版本 + 计算 tag + 判断是否需要构建
+  # ---------------------------------------------------------------------------
+  resolve:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      sha: ${{ steps.r.outputs.sha }}
+      short_sha: ${{ steps.r.outputs.short_sha }}
+      version: ${{ steps.r.outputs.version }}
+      image: ${{ steps.r.outputs.image }}
+      tags: ${{ steps.r.outputs.tags }}
+      should_build: ${{ steps.r.outputs.should_build }}
+    steps:
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve upstream ref
+        id: r
+        env:
+          REF_INPUT: ${{ github.event.inputs.ref }}
+          FORCE: ${{ github.event.inputs.force }}
+        run: |
+          set -euo pipefail
+          REF="${REF_INPUT:-master}"
+          echo "::notice::upstream ref = ${REF}"
+
+          rm -rf upstream && mkdir upstream && cd upstream
+          git init -q .
+          git remote add origin "${UPSTREAM_REPO}"
+          git fetch -q --depth 1 origin "${REF}"
+          git checkout -q FETCH_HEAD
+
+          SHA="$(git rev-parse HEAD)"
+          SHORT="$(git rev-parse --short=8 HEAD)"
+          VERSION="$(node -p "require('./package.json').version")"
+          echo "::notice::upstream ${SHA} (version ${VERSION})"
+
+          IMAGE="${REGISTRY}/${IMAGE_NAME,,}"
+          {
+            echo "sha=${SHA}"
+            echo "short_sha=${SHORT}"
+            echo "version=${VERSION}"
+            echo "image=${IMAGE}"
+          } >> "$GITHUB_OUTPUT"
+
+          # ---- tags ----
+          TAGS=("${IMAGE}:${VERSION}" "${IMAGE}:sha-${SHORT}")
+          if [ "${GITHUB_REF_TYPE:-}" = "branch" ] && [ "${GITHUB_REF_NAME:-}" = "main" ]; then
+            TAGS+=("${IMAGE}:latest")
+          fi
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            TAGS+=("${IMAGE}:${GITHUB_REF_NAME}")
+          fi
+          {
+            echo "tags<<EOF"
+            printf '%s\n' "${TAGS[@]}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          printf 'tags:\n'; printf '  %s\n' "${TAGS[@]}"
+
+          # ---- 是否需要构建 ----
+          SHOULD="true"
+          if [ "${GITHUB_EVENT_NAME}" = "schedule" ] && [ "${FORCE:-false}" != "true" ]; then
+            if docker buildx imagetools inspect "${IMAGE}:sha-${SHORT}" >/dev/null 2>&1; then
+              echo "::notice::${IMAGE}:sha-${SHORT} 已存在，跳过构建"
+              SHOULD="false"
+            fi
+          fi
+          echo "should_build=${SHOULD}" >> "$GITHUB_OUTPUT"
+          echo "should_build = ${SHOULD}"
+
+  # ---------------------------------------------------------------------------
+  # 分架构原生构建，按 digest 推送
+  # ---------------------------------------------------------------------------
+  build:
+    needs: resolve
+    if: needs.resolve.outputs.should_build == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            arch: arm64
+            runner: ubuntu-24.04-arm # 公开仓库免费的原生 arm64 runner
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build (${{ matrix.platform }}) by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            DSH_REF=${{ needs.resolve.outputs.sha }}
+          outputs: >-
+            type=image,name=${{ needs.resolve.outputs.image }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+
+      - name: Export digest
+        run: |
+          set -euo pipefail
+          mkdir -p "${{ runner.temp }}/digests"
+          digest="${{ steps.build.outputs.digest }}"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+          echo "digest = ${digest}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # 合并多架构 manifest 并打上 tag
+  # ---------------------------------------------------------------------------
+  merge:
+    needs: [resolve, build]
+    if: needs.resolve.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create multi-arch manifest
+        env:
+          IMAGE: ${{ needs.resolve.outputs.image }}
+          TAGS: ${{ needs.resolve.outputs.tags }}
+        run: |
+          set -euo pipefail
+
+          ARGS=()
+          while IFS= read -r t; do
+            [ -n "${t}" ] && ARGS+=(-t "${t}")
+          done <<< "${TAGS}"
+
+          SOURCES=()
+          for f in "${{ runner.temp }}"/digests/*; do
+            [ -e "${f}" ] || continue
+            SOURCES+=("${IMAGE}@sha256:$(basename "${f}")")
+          done
+
+          echo "manifest sources:"
+          printf '  %s\n' "${SOURCES[@]}"
+
+          docker buildx imagetools create "${ARGS[@]}" "${SOURCES[@]}"
+
+          echo "::notice::已推送多架构镜像："
+          docker buildx imagetools inspect "${IMAGE}:sha-${{ needs.resolve.outputs.short_sha }}"

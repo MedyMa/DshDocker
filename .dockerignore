@@ -1,0 +1,10 @@
+.git
+.github
+.gitignore
+.gitattributes
+docker-compose.yml
+data
+workspace
+*.log
+*.md
+!README.md
