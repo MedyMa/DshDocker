@@ -287,11 +287,23 @@ docker buildx build --platform linux/arm64 -t dshdocker .
 
 ## CI 说明
 
-`.github/workflows/docker.yml`：**resolve**（浅克隆上游、读版本、算 tag、`sha-<short>` 已存在则跳过）
-→ **build**（原生矩阵：`ubuntu-24.04` 构建 amd64、`ubuntu-24.04-arm` 构建 arm64，按 digest 推送）
-→ **merge**（合成一个多架构 manifest）。
+| workflow | 作用 |
+|---|---|
+| `docker.yml` | **resolve**（浅克隆上游、读版本、算 tag）→ **build**（`ubuntu-24.04` 构建 amd64、`ubuntu-24.04-arm` 构建 arm64，按 digest 推送）→ **merge**（合成多架构 manifest） |
+| `desktop-win.yml` | 从上游源码构建 Windows x64 桌面端（未签名） |
+| `ghcr-prune.yml` | 每周清理 GHCR 里无 tag 的包版本 |
 
-所有 action 都锁定在 `action.yml` 声明 `runs.using: node24` 的大版本 —— 不再有 Node 20 弃用警告。
+`docker.yml` 的「`sha-<short>` 已存在就跳过」**只在定时任务时生效**，`push` 触发一律重建
+（改了 `Dockerfile` 就该重建），所以**改一行文档也会重建整个多架构镜像**；想避免可给 push 加 `paths` 过滤。
+
+**GHCR 里为什么有一堆无 tag 版本**：每次构建会推送多个 manifest —— 2 个平台镜像、2 个 provenance
+attestation（buildx 默认产出，内含时间戳/run id，每次内容都不同）、各架构的单架构 index，最后 merge
+出带 tag 的多架构 index。GHCR 把**每个 manifest** 都算作一个版本，所以那 30 多个里只有 1 个带 tag
+（`latest`/`sha-<short>`/`<版本>` 三个 tag 指向同一个 index）—— **镜像内容其实只有一份**，`docker pull`
+永远拿到最新的。`ghcr-prune.yml` 每周日清理这些无 tag 版本（只删 untagged，保留最近 10 个 + 全部带 tag）。
+
+所有 action 都锁定在 `action.yml` 声明 `runs.using: node24` 的大版本 —— 不再有 Node 20 弃用警告
+（`ghcr-prune.yml` 不含 action，纯用 `gh` CLI，同样与 Node 无关）。
 
 ---
 

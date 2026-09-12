@@ -1,0 +1,134 @@
+name: Prune GHCR untagged versions
+
+# 清理 ghcr.io/<owner>/dshdocker 里**无 tag** 的包版本。
+#
+# 为什么会有垃圾版本：docker.yml 每次构建会推送多个 manifest ——
+#   - 2 个平台镜像 manifest（linux/amd64、linux/arm64）
+#   - 2 个 provenance attestation（buildx 默认产出，artifactType =
+#     application/vnd.docker.attestation.manifest.v1+json，layer 为 in-toto 证明）
+#   - 各架构 job 按 digest 推送的单架构 index
+#   - merge 出来的多架构 index（带 tag）
+# GHCR 的 versions 页面把**每个 manifest** 都计为一个版本，而 attestation 每次构建
+# 内容都不同（含时间戳/run id），所以旧版本不断退化成 untagged。实测一次 35 个版本里
+# 只有 1 个带 tag（latest / sha-<short> / <version> 三个 tag 指向同一个多架构 index）。
+#
+# 本 workflow 只删 untagged，永远不动带 tag 的版本，并保留最近 N 个 untagged 作为缓冲。
+# 实测「带 tag 的 index」正是最近一次构建产出的那个，它引用的 attestation 也在最新的
+# 那几个 untagged 里，所以保留最近 N 个即可覆盖。即便某个 attestation 被删也不影响
+# docker pull —— 客户端拉取时只会按平台选中 image manifest，不会去取 attestation。
+#
+# 为什么不用 actions/delete-package-versions：它的最新版 v5.0.0（2024-01）声明
+# runs.using: node20，会重新引入 Node 20 弃用警告。gh CLI 是 Go 二进制，不涉及 Node。
+
+on:
+  schedule:
+    - cron: "0 3 * * 0" # 每周日 UTC 03:00 = 北京时间 11:00
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "只列出将要删除的版本，不实际删除"
+        type: boolean
+        required: false
+        default: true
+      keep:
+        description: "保留最近多少个无 tag 版本"
+        required: false
+        default: "10"
+
+permissions:
+  contents: read
+  packages: write # 删除包版本需要
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  prune:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Prune untagged package versions
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+          PACKAGE: ${{ github.event.repository.name }}
+          # 定时任务没有 inputs → 默认真删；手动触发默认 dry-run，先看清楚再删。
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run || 'false' }}
+          KEEP: ${{ github.event.inputs.keep || '10' }}
+        run: |
+          set -euo pipefail
+
+          API_PATH="/users/${OWNER}/packages/container/${PACKAGE}/versions"
+          echo "包        : ${OWNER}/${PACKAGE}"
+          echo "保留(无tag): 最近 ${KEEP} 个"
+          echo "模式      : $( [ "${DRY_RUN}" = "true" ] && echo 'DRY-RUN（不删）' || echo '实际删除' )"
+          echo
+
+          # ---- 拉取所有版本（tag / 创建时间 / digest）----
+          ROWS="$(gh api --paginate -H 'Accept: application/vnd.github+json' \
+            "${API_PATH}?per_page=100" \
+            --jq '.[] | [(.id|tostring), .created_at, ((.metadata.container.tags // [])|join("|")), (.name // "")] | @tsv')" || {
+              echo "::error::读取包版本失败。请确认本 workflow 有 packages: write 权限，"
+              echo "::error::且该包已关联到本仓库（Package settings → Manage Actions access）。"
+              exit 1
+            }
+
+          if [ -z "${ROWS}" ]; then
+            echo "::notice::该包没有任何版本"
+            exit 0
+          fi
+
+          TOTAL=$(printf '%s\n' "${ROWS}" | wc -l)
+          TAGGED=$(printf '%s\n' "${ROWS}" | awk -F'\t' '$3 != ""' | wc -l)
+          echo "版本总数: ${TOTAL}（带 tag ${TAGGED}，无 tag $((TOTAL - TAGGED))）"
+          echo
+
+          # ---- 选出待删：无 tag 且不在「最近 KEEP 个」之内 ----
+          # created_at 是 ISO8601，按字段 2 倒序即最新在前。
+          KEEP_LIST="$(printf '%s\n' "${ROWS}" | awk -F'\t' '$3 == ""' | sort -t$'\t' -k2,2r | head -n "${KEEP}")"
+          DEL_LIST="$(printf '%s\n' "${ROWS}" | awk -F'\t' '$3 == ""' | sort -t$'\t' -k2,2r | tail -n "+$((KEEP + 1))")"
+
+          echo "---- 保留（最近 ${KEEP} 个无 tag）----"
+          if [ -z "${KEEP_LIST}" ]; then echo "  （无）"; else
+            printf '%s\n' "${KEEP_LIST}" | awk -F'\t' '{printf "  %s  %s  %s\n", $2, substr($4,1,19), $1}'
+          fi
+          echo
+
+          if [ -z "${DEL_LIST}" ]; then
+            echo "✅ 没有需要清理的无 tag 版本"
+            exit 0
+          fi
+
+          echo "---- 待删除（无 tag 且超出保留数）----"
+          printf '%s\n' "${DEL_LIST}" | awk -F'\t' '{printf "  %s  %s  %s\n", $2, substr($4,1,19), $1}'
+          echo
+
+          DELETED=0
+          FAILED=0
+          while IFS=$'\t' read -r id created _tags digest; do
+            [ -n "${id}" ] || continue
+            if [ "${DRY_RUN}" = "true" ]; then
+              echo "  [dry-run] 会删除 id=${id} (${created})"
+              continue
+            fi
+            if gh api -X DELETE "${API_PATH}/${id}" >/dev/null 2>&1; then
+              DELETED=$((DELETED + 1))
+              echo "  已删除 id=${id} (${created})"
+            else
+              FAILED=$((FAILED + 1))
+              echo "  ::warning::删除失败 id=${id} (${created})"
+            fi
+          done <<< "${DEL_LIST}"
+
+          echo
+          if [ "${DRY_RUN}" = "true" ]; then
+            echo "::notice::DRY-RUN 结束：本可以删除 $(printf '%s\n' "${DEL_LIST}" | wc -l) 个无 tag 版本"
+          else
+            echo "::notice::已删除 ${DELETED} 个无 tag 版本，失败 ${FAILED} 个"
+            if [ "${FAILED}" -gt 0 ]; then
+              echo "::error::有 ${FAILED} 个版本删除失败 —— 通常是权限不足（需要 packages: write，"
+              echo "::error::且该包已关联到本仓库）。报绿但没删掉会造成误导，所以这里显式失败。"
+              exit 1
+            fi
+          fi

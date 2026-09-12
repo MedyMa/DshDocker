@@ -300,12 +300,25 @@ The build is heavy: `build:native-system` (needs `musl-gcc`) → `build:lib` (ts
 
 ## CI
 
-`.github/workflows/docker.yml`: **resolve** (shallow-clone upstream, read version, compute tags,
-skip when the `sha-<short>` image already exists) → **build** (native matrix: `ubuntu-24.04` for
-amd64, `ubuntu-24.04-arm` for arm64, pushed by digest) → **merge** (one multi-arch manifest).
+| Workflow | Purpose |
+|---|---|
+| `docker.yml` | **resolve** (shallow-clone upstream, read version, compute tags) → **build** (`ubuntu-24.04` for amd64, `ubuntu-24.04-arm` for arm64, pushed by digest) → **merge** (one multi-arch manifest) |
+| `desktop-win.yml` | build the unsigned Windows x64 desktop app from upstream source |
+| `ghcr-prune.yml` | weekly cleanup of untagged GHCR package versions |
 
-All actions are pinned to majors whose `action.yml` declares `runs.using: node24` — no
-Node 20 deprecation warnings.
+The `sha-<short>` “already exists, skip” check in `docker.yml` **only applies to scheduled runs**;
+every push rebuilds (intentional — a `Dockerfile` change should rebuild), which means **a one-line docs
+change also rebuilds the whole multi-arch image**. Add a `paths` filter to the push trigger to avoid that.
+
+**Why GHCR lists so many untagged versions**: each build pushes several manifests — 2 platform images,
+2 provenance attestations (buildx's default; they embed timestamps/run ids, so they differ every build),
+per-arch indexes, and finally the tagged multi-arch index. GHCR counts **every manifest** as a version,
+so of those ~30+ entries only 1 carries tags (`latest`/`sha-<short>`/`<version>` all point at the same
+index) — **there is only one actual image**, and `docker pull` always gets the newest.
+`ghcr-prune.yml` cleans the untagged ones weekly (untagged only; keeps the newest 10 plus all tagged).
+
+All actions are pinned to majors whose `action.yml` declares `runs.using: node24` — no Node 20
+deprecation warnings (`ghcr-prune.yml` uses no actions, just the `gh` CLI, so it is Node-agnostic too).
 
 ---
 
