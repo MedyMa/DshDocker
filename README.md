@@ -315,7 +315,14 @@ change also rebuilds the whole multi-arch image**. Add a `paths` filter to the p
 per-arch indexes, and finally the tagged multi-arch index. GHCR counts **every manifest** as a version,
 so of those ~30+ entries only 1 carries tags (`latest`/`sha-<short>`/`<version>` all point at the same
 index) — **there is only one actual image**, and `docker pull` always gets the newest.
-`ghcr-prune.yml` cleans the untagged ones weekly (untagged only; keeps the newest 10 plus all tagged).
+
+`ghcr-prune.yml` cleans the untagged ones weekly. It must **not** simply keep the newest N by time: a
+platform image manifest is a reproducible build artifact whose digest is stable across builds, so its
+`created_at` is old and it would sort into the delete range while the tagged multi-arch index still
+references it — that breaks `linux/amd64` in `:latest` with `MANIFEST_UNKNOWN`. Instead it computes a
+**protection set** (tagged versions plus the keep range, and every digest those reference as an index)
+and only deletes versions that are untagged *and* unprotected. If it cannot obtain a registry token it
+fails outright and deletes nothing.
 
 All actions are pinned to majors whose `action.yml` declares `runs.using: node24` — no Node 20
 deprecation warnings (`ghcr-prune.yml` uses no actions, just the `gh` CLI, so it is Node-agnostic too).

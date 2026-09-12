@@ -300,7 +300,13 @@ docker buildx build --platform linux/arm64 -t dshdocker .
 attestation（buildx 默认产出，内含时间戳/run id，每次内容都不同）、各架构的单架构 index，最后 merge
 出带 tag 的多架构 index。GHCR 把**每个 manifest** 都算作一个版本，所以那 30 多个里只有 1 个带 tag
 （`latest`/`sha-<short>`/`<版本>` 三个 tag 指向同一个 index）—— **镜像内容其实只有一份**，`docker pull`
-永远拿到最新的。`ghcr-prune.yml` 每周日清理这些无 tag 版本（只删 untagged，保留最近 10 个 + 全部带 tag）。
+永远拿到最新的。
+
+`ghcr-prune.yml` 每周日清理这些无 tag 版本。它**不能**简单按时间保留最新 N 个：平台镜像 manifest 是
+可复现构建的产物，digest 跨构建稳定、`created_at` 很早，按时间排序必然落进删除区，而带 tag 的多架构
+index 仍在引用它 —— 这么删会让 `:latest` 的 `linux/amd64` 变成 `MANIFEST_UNKNOWN`。所以它先算**保护集**
+（带 tag 的版本 + 保留区，以及它们作为 index 所引用的每个 digest），只删既无 tag 又不在保护集里的；
+拿不到 registry token 时直接失败、一个都不删。
 
 所有 action 都锁定在 `action.yml` 声明 `runs.using: node24` 的大版本 —— 不再有 Node 20 弃用警告
 （`ghcr-prune.yml` 不含 action，纯用 `gh` CLI，同样与 Node 无关）。
