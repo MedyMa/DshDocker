@@ -189,10 +189,29 @@ jobs:
         working-directory: upstream
         run: pnpm install --frozen-lockfile
 
+      # 上游自 bebf88de「Use Electron Node runtime and replace Windows installations by
+      # directory」起，发布/签名配置**只认** apps/desktop/.env.windows，并且会把同名的
+      # 环境变量从传入环境里剥离（desktop-package-environment.mjs 的 AMBIENT_RELEASE_SETTING
+      # 正则），因此原先用 `env: DSH_DESKTOP_APP_ID` 传参的做法已失效，会直接报
+      #   Error: desktop package: cannot read .../apps/desktop/.env.windows
+      #   ... copy .../.env.windows.example and fill in the local settings
+      # 未签名构建实际校验的只有：APP_ID（反向域名正则）+ AUTO_UPDATE_ENV + 与之对应的
+      # mandatory-update origin（必须是干净 HTTPS origin）。这里以官方模板为底、只覆盖
+      # APP_ID —— 将来模板新增必需键时也能自动跟上，不必再来改 workflow。
+      - name: Provide the Windows packaging environment
+        shell: bash
+        working-directory: upstream/apps/desktop
+        env:
+          APP_ID: ${{ env.APP_ID }}
+        run: |
+          set -euo pipefail
+          cp .env.windows.example .env.windows
+          sed -i "s|^DSH_DESKTOP_APP_ID=.*|DSH_DESKTOP_APP_ID=${APP_ID}|" .env.windows
+          # 只回显非敏感键，确认关键项就位（签名与 COS 密钥保持模板中的空值/注释）
+          grep -E '^(DSH_DESKTOP_APP_ID|DSH_DESKTOP_AUTO_UPDATE_ENV|DSH_DESKTOP_MANDATORY_UPDATE_(TEST|PROD)_ORIGIN)=' .env.windows
+
       - name: Package Windows x64 (unsigned)
         working-directory: upstream
-        env:
-          DSH_DESKTOP_APP_ID: ${{ env.APP_ID }}
         run: pnpm run package:desktop:win:x64:unsigned
 
       # 架构闸门 + 产物清单。上游本来就没有 32 位通道（desktop-build-paths.mjs 的
@@ -254,7 +273,7 @@ jobs:
           NOTES="${NOTES}"$'\n'"- **64 位（x64）**：主程序与随包分发的 node.exe 均经 PE 头校验为 AMD64；不含 32 位应用"
           NOTES="${NOTES}"$'\n'"  （安装包外壳是 NSIS 的 32 位引导程序，属 NSIS 自身限制，与安装后的应用位数无关）"
           NOTES="${NOTES}"$'\n'"- **未签名**：Windows SmartScreen 会提示未知发布者，安装时选「更多信息 → 仍要运行」"
-          NOTES="${NOTES}"$'\n'"- 未签名包不含自动更新配置，属本地安装测试用途"
+          NOTES="${NOTES}"$'\n'"- 发布/更新策略取上游 .env.windows.example 模板默认值（AUTO_UPDATE_ENV=test），仅供本地安装测试"
           NOTES="${NOTES}"$'\n\n'"由 DshDocker 的 desktop-win workflow 自动构建。"
 
           if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
