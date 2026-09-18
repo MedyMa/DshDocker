@@ -178,28 +178,12 @@ jobs:
           echo "HEAD     = $(git rev-parse HEAD)"
           echo "expected = ${SHA}"
 
-      # 上游遗留问题：桌面运行时冒烟测试仍然断言 fs-ext 可加载，但 fs-ext
-      # 早已不是依赖 —— 上游设计笔记（2026-09-07-prebuilt-system-primitives）
-      # 说明它已被 @deepseek-ai/node-addon-system（稳定 Node-API、预编译）取代，
-      # 且「Windows 保留既有 koffi 信号量」。仓库里没有任何运行时代码 require
-      # fs-ext，也没有任何 package.json / lockfile / vendor 声明它；上游公开 CI
-      # 又从不打包桌面版，所以这条陈旧断言一直没被清理，会以
-      #   Error: Cannot find module 'fs-ext'
-      #   Error: desktop package: pnpm run prepare:dsh exited with 1
-      # 阻断 Windows 打包。这里把它注释掉，并在缺失时显式失败以便将来更新。
-      - name: Work around the stale fs-ext assertion
-        shell: bash
-        working-directory: upstream
-        run: |
-          set -euo pipefail
-          F="apps/desktop/tests/fixtures/runtime-payload-smoke.mjs"
-          if ! grep -q '^  checkFsExt()$' "$F"; then
-            echo "::error::上游已修改冒烟测试，不再以 '  checkFsExt()' 调用；请重新评估本 workaround"
-            grep -n 'checkFsExt' "$F" || true
-            exit 1
-          fi
-          sed -i 's|^  checkFsExt()$|  // DshDocker: fs-ext 已不是依赖（改用 @deepseek-ai/node-addon-system；Windows 用 koffi），跳过陈旧断言|' "$F"
-          grep -n 'DshDocker:' "$F"
+      # 注：此处曾有一个 “Work around the stale fs-ext assertion” 步骤，用于注释掉上游
+      # apps/desktop/tests/fixtures/runtime-payload-smoke.mjs 里陈旧的 checkFsExt() 断言
+      # （该断言会以 Error: Cannot find module 'fs-ext' 阻断 Windows 打包）。
+      # 上游已在 6b05ed53「test(desktop): remove obsolete fs-ext payload smoke」中自
+      # 行移除该断言（+2/−19 行；该文件现已是 0 处 fs-ext/checkFsExt，改用 koffi），
+      # 本 workaround 因此不再需要，已删除。若将来上游又出现同类阻塞，再按需重新评估。
 
       - name: Install dependencies
         working-directory: upstream
