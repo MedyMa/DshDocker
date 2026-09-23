@@ -198,6 +198,23 @@ jobs:
         working-directory: upstream
         run: pnpm install --frozen-lockfile
 
+      # packaging 脚本由 tsx 加载，而 package-target.ts 会**无条件静态 import**
+      # ./macos-notarization-proxy.ts（package-target.ts:26）；后者又
+      #   import { tryLockExclusive } from '@deepseek-ai/node-addon-system/flock'
+      # 该子路径的 exports 指向 tsc 产物 lib/flock.js，而 lib/ 被 .gitignore 忽略、
+      # 不在仓库里 —— 不先构建，tsx 在**模块求值阶段**就失败，连 configuration /
+      # toolchain 校验都跑不到：
+      #   Error [ERR_MODULE_NOT_FOUND]: Cannot find module
+      #     .../apps/desktop/node_modules/@deepseek-ai/node-addon-system/lib/flock.js
+      #     imported from .../apps/desktop/scripts/macos-notarization-proxy.ts
+      # （2026-09-23 build-win 失败的第二个原因；上游约 09-20 之后引入该 import。）
+      # 上游 release.yml 同样单独构建这一包（Landlock entry 那一步用的就是同一条命令）。
+      # 注：这是 Windows 构建却依赖 macOS 公证模块的传递依赖，属上游的跨平台耦合，
+      # 这里只能照上游的做法补齐产物。
+      - name: Build the node-addon-system entry
+        working-directory: upstream
+        run: pnpm --dir native/system run build:ts
+
       # 上游自 bebf88de「Use Electron Node runtime and replace Windows installations by
       # directory」起，发布/签名配置**只认** apps/desktop/.env.windows，并且会把同名的
       # 环境变量从传入环境里剥离（desktop-package-environment.mjs 的 AMBIENT_RELEASE_SETTING
