@@ -50,6 +50,15 @@ env:
   # Electron 应用 ID，必须是反向域名形式。
   # 想改的话在仓库 Settings → Variables 里加一个 DSH_DESKTOP_APP_ID。
   APP_ID: ${{ vars.DSH_DESKTOP_APP_ID || 'com.medyma.dsh' }}
+  # mandatory-update origin：上游自 c05771d8「build(desktop): isolate test downloads by
+  # release ID」起把示例文件里的这两个值**清空**（改为打包者自填）。而
+  # desktop-policy-environment.mjs 的 resolveDesktopPolicyEnvironment() 是在
+  # package-target.ts 的 `--unsigned` 短路**之前**执行的 —— 所以未签名构建同样要求
+  # 「被选中的那个 origin」非空且是干净 HTTPS origin。默认值取上游清空前
+  # （desktop-v0.1.6-alpha.2 / ddefc45）的示例值；要换域名时在仓库 Settings → Variables
+  # 里覆盖同名变量，不必改本文件。两个都填，避免将来切换 AUTO_UPDATE_ENV 时踩空。
+  UPDATE_TEST_ORIGIN: ${{ vars.DSH_DESKTOP_MANDATORY_UPDATE_TEST_ORIGIN || 'https://harness-test.deepseek.com' }}
+  UPDATE_PROD_ORIGIN: ${{ vars.DSH_DESKTOP_MANDATORY_UPDATE_PROD_ORIGIN || 'https://harness.deepseek.com' }}
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -195,20 +204,60 @@ jobs:
       # 正则），因此原先用 `env: DSH_DESKTOP_APP_ID` 传参的做法已失效，会直接报
       #   Error: desktop package: cannot read .../apps/desktop/.env.windows
       #   ... copy .../.env.windows.example and fill in the local settings
-      # 未签名构建实际校验的只有：APP_ID（反向域名正则）+ AUTO_UPDATE_ENV + 与之对应的
-      # mandatory-update origin（必须是干净 HTTPS origin）。这里以官方模板为底、只覆盖
-      # APP_ID —— 将来模板新增必需键时也能自动跟上，不必再来改 workflow。
+      # 未签名构建仍会校验：APP_ID（反向域名正则）+ AUTO_UPDATE_ENV + **被选中的那个**
+      # mandatory-update origin（干净 HTTPS origin）—— 因为 desktop-package-environment.mjs
+      # 的 validateDesktopPackageEnvironment 在 `--unsigned` 短路之前就调用了
+      # resolveDesktopPolicyEnvironment（package-target.ts 的 configuration 阶段）。
+      # 只 cp 模板 + 覆盖 APP_ID 会失败在打包中途：
+      #   Error: desktop package: DSH_DESKTOP_MANDATORY_UPDATE_TEST_ORIGIN requires an HTTPS origin
+      # （2026-09-23 那次 build-win 失败即此因：上游 09-20 才把模板里的值清空，而模板注释
+      #  仍写着 “The selected mandatory-update origin is required, including unsigned and
+      #  preparation builds”。）
+      # 故此处以官方模板为底，覆盖 APP_ID 与两个 origin，并**显式断言必需键非空**——
+      # 让配置缺失在本步骤就带着键名失败，而不是等打包 exit 1 后无从定位。
+      # 注意：中转变量刻意**不带** DSH_ 前缀（UPDATE_TEST_ORIGIN，而非
+      # DSH_DESKTOP_MANDATORY_UPDATE_TEST_ORIGIN）—— 带前缀的名字会被上面那条
+      # AMBIENT_RELEASE_SETTING 正则从传入环境里剥掉，值根本传不进来；只有写进
+      # .env.windows 文件的值才作数。
       - name: Provide the Windows packaging environment
         shell: bash
         working-directory: upstream/apps/desktop
         env:
           APP_ID: ${{ env.APP_ID }}
+          UPDATE_TEST_ORIGIN: ${{ env.UPDATE_TEST_ORIGIN }}
+          UPDATE_PROD_ORIGIN: ${{ env.UPDATE_PROD_ORIGIN }}
         run: |
           set -euo pipefail
           cp .env.windows.example .env.windows
-          sed -i "s|^DSH_DESKTOP_APP_ID=.*|DSH_DESKTOP_APP_ID=${APP_ID}|" .env.windows
+
+          # 覆盖单个 dotenv 键；模板将来若删掉该键则追加，保证值一定落地。
+          set_setting() {
+            local key="$1"
+            local value="$2"
+            if grep -q "^${key}=" .env.windows; then
+              sed -i "s|^${key}=.*|${key}=${value}|" .env.windows
+            else
+              printf '%s=%s\n' "${key}" "${value}" >> .env.windows
+            fi
+          }
+
+          set_setting DSH_DESKTOP_APP_ID "${APP_ID}"
+          set_setting DSH_DESKTOP_MANDATORY_UPDATE_TEST_ORIGIN "${UPDATE_TEST_ORIGIN}"
+          set_setting DSH_DESKTOP_MANDATORY_UPDATE_PROD_ORIGIN "${UPDATE_PROD_ORIGIN}"
+
+          # 必需键断言：上游 resolve* 系列对这几个键要求「非空」，空值会让打包失败。
+          for key in DSH_DESKTOP_APP_ID \
+                     DSH_DESKTOP_MANDATORY_UPDATE_TEST_ORIGIN \
+                     DSH_DESKTOP_MANDATORY_UPDATE_PROD_ORIGIN; do
+            value="$(sed -n "s|^${key}=||p" .env.windows | head -n1)"
+            if [ -z "${value}" ]; then
+              echo "::error::.env.windows: ${key} 为空；上游 desktop-policy-environment 要求非空"
+              exit 1
+            fi
+          done
+
           # 只回显非敏感键，确认关键项就位（签名与 COS 密钥保持模板中的空值/注释）
-          grep -E '^(DSH_DESKTOP_APP_ID|DSH_DESKTOP_AUTO_UPDATE_ENV|DSH_DESKTOP_MANDATORY_UPDATE_(TEST|PROD)_ORIGIN)=' .env.windows
+          grep -E '^(DSH_DESKTOP_APP_ID|DSH_DESKTOP_AUTO_UPDATE_ENV|DSH_DESKTOP_MANDATORY_UPDATE_(TEST|PROD)_ORIGIN|DSH_DESKTOP_MANDATORY_UPDATE_CONFIG)=' .env.windows || true
 
       - name: Package Windows x64 (unsigned)
         working-directory: upstream
