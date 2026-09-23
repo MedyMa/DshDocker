@@ -167,25 +167,64 @@ jobs:
           python --version || python3 --version
           echo "APP_ID=${APP_ID}"
 
+      # ---------------------------------------------------------------------------
+      # 为什么把上游 clone 到短路径 C:\u，而不是工作区里的 upstream/
+      #
+      # 打包后 Office 引擎的真实位置是：
+      #   <repo>\apps\desktop\.desktop-build\targets\win-x64\unsigned-artifacts\
+      #     win-unpacked\resources\app.asar.unpacked\dsh\node_modules\
+      #     @deepseek-ai\libreoffice-kit-win32-x64\program\...
+      # 在默认工作区 D:\a\DshDocker\DshDocker\upstream 下该基路径已达 210 字符，
+      # 叠加 LibreOffice 自带的深层子目录（python-core-*/lib/site-packages、share/…）
+      # 会越过 Windows MAX_PATH(260)，原生引擎初始化失败，打包后的冒烟检查报：
+      #   ConversionError: LibreOffice native conversion failed: Unknown LibreOfficeKit exception
+      # 主机侧用的是 pnpm store 路径（基路径 166），不越界 —— 这正是「prepare 阶段的
+      # round-trip 能过、只有打包后的 smoke 过不了」的原因。
+      # C:\u 把基路径降到 181、最深路径约 242，回到限内；workflow 其余步骤继续按
+      # `upstream/...` 引用，工作区里放一个 junction 指过去即可。
+      # ---------------------------------------------------------------------------
+      - name: Enable Windows long paths
+        shell: pwsh
+        run: |
+          # 双保险：除缩短路径外再打开系统长路径开关（只对声明了 longPathAware 的进程生效）。
+          New-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem' `
+            -Name 'LongPathsEnabled' -Value 1 -PropertyType DWord -Force | Out-Null
+          Write-Host "LongPathsEnabled = $((Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem' -Name 'LongPathsEnabled').LongPathsEnabled)"
+
       - name: Clone upstream at the resolved commit
-        shell: bash
+        shell: pwsh
         env:
           SHA: ${{ needs.resolve.outputs.sha }}
           REF: ${{ needs.resolve.outputs.ref }}
         run: |
-          set -euo pipefail
-          rm -rf upstream
-          git init -q upstream
-          cd upstream
-          git remote add origin "${UPSTREAM_REPO}"
-          # 优先按 commit 拉（最可复现）；失败再按 ref 拉
-          if ! git fetch -q --depth 1 origin "${SHA}"; then
-            echo "按 commit 拉取失败，回退到 ref=${REF}"
-            git fetch -q --depth 1 origin "${REF}"
-          fi
-          git checkout -q FETCH_HEAD
-          echo "HEAD     = $(git rev-parse HEAD)"
-          echo "expected = ${SHA}"
+          $ErrorActionPreference = 'Stop'
+          $short = 'C:\u'
+          $link = Join-Path $env:GITHUB_WORKSPACE 'upstream'
+          if (Test-Path $short) { Remove-Item -Recurse -Force $short }
+          # 只删链接本身，避免 Remove-Item -Recurse 顺着 junction 删掉真实内容
+          if (Test-Path $link) { (Get-Item $link -Force).Delete() }
+
+          git init -q $short
+          if ($LASTEXITCODE -ne 0) { throw 'git init failed' }
+          Push-Location $short
+          try {
+            git remote add origin $env:UPSTREAM_REPO
+            # 优先按 commit 拉（最可复现）；失败再按 ref 拉
+            git fetch -q --depth 1 origin $env:SHA
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host "按 commit 拉取失败，回退到 ref=$($env:REF)"
+              git fetch -q --depth 1 origin $env:REF
+              if ($LASTEXITCODE -ne 0) { throw 'git fetch failed' }
+            }
+            git checkout -q FETCH_HEAD
+            if ($LASTEXITCODE -ne 0) { throw 'git checkout failed' }
+            Write-Host "HEAD     = $(git rev-parse HEAD)"
+            Write-Host "expected = $($env:SHA)"
+          } finally { Pop-Location }
+
+          New-Item -ItemType Junction -Path $link -Target $short | Out-Null
+          Write-Host "junction: $link -> $short"
+          Get-Item $link | Select-Object FullName, LinkType, Target
 
       # 注：此处曾有一个 “Work around the stale fs-ext assertion” 步骤，用于注释掉上游
       # apps/desktop/tests/fixtures/runtime-payload-smoke.mjs 里陈旧的 checkFsExt() 断言
@@ -352,3 +391,40 @@ jobs:
               --notes "${NOTES}" ${PRERELEASE}
           fi
           echo "::notice::已发布 ${TAG}"
+
+      # ---------------------------------------------------------------------------
+      # 失败取证：托管 runner 在 job 结束后立即销毁，日志下载 API 对当前凭据也不可用，
+      # 所以打包后 Office 引擎的现场只能在这里捞。用于判定「Unknown LibreOfficeKit
+      # exception」到底是路径越界、原生 DLL 加载失败，还是别的原因。
+      # ---------------------------------------------------------------------------
+      - name: Diagnose the packaged Office engine
+        if: failure()
+        shell: pwsh
+        run: |
+          $lp = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem' -Name 'LongPathsEnabled' -ErrorAction SilentlyContinue).LongPathsEnabled
+          Write-Host "LongPathsEnabled = $lp"
+          $root = 'C:\u\apps\desktop\.desktop-build\targets\win-x64\unsigned-artifacts\win-unpacked\resources\app.asar.unpacked\dsh\node_modules\@deepseek-ai\libreoffice-kit-win32-x64'
+          Write-Host "engine root     = $root"
+          Write-Host "engine root len = $($root.Length)"
+          if (-not (Test-Path $root)) { Write-Host '（打包后的引擎目录不存在：可能尚未走到打包阶段）'; exit 0 }
+
+          $files = @(Get-ChildItem $root -Recurse -File -ErrorAction SilentlyContinue)
+          Write-Host "`n=== 引擎文件数: $($files.Count) ==="
+          Write-Host "=== 最深的 8 条路径 ==="
+          $files | Sort-Object { $_.FullName.Length } -Descending | Select-Object -First 8 |
+            ForEach-Object { '{0,4}  {1}' -f $_.FullName.Length, $_.FullName }
+          $over = @($files | Where-Object { $_.FullName.Length -ge 260 }).Count
+          Write-Host "`n>=260 字符的路径数量: $over / $($files.Count)"
+
+          $exe = Join-Path $root 'bin\libreoffice-kit.exe'
+          Write-Host "`nengine exe exists = $(Test-Path $exe)"
+          if (Test-Path $exe) {
+            Write-Host '=== 直接运行引擎 --help（验证原生 DLL 能否加载）==='
+            & $exe --help 2>&1 | Select-Object -First 25
+            Write-Host "exit code = $LASTEXITCODE"
+          }
+
+          Write-Host "`n=== 打包流水 events.jsonl（尾部）==="
+          $ev = Get-ChildItem 'C:\u\apps\desktop\.desktop-build\packaging-runs' -Recurse -Filter events.jsonl -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if ($ev) { Get-Content $ev.FullName -Tail 30 } else { Write-Host '（未找到 events.jsonl）' }
